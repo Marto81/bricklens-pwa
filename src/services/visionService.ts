@@ -424,18 +424,33 @@ export async function identifyMinifigureFromImage(options: {
       const formData = new FormData();
       formData.append('query_image', options.blob, 'minifig_scan.webp');
 
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3800);
+      const endpoints = [
+        'https://api.brickognize.com/predict/figs/',
+        '/api/brickognize.php?mode=figs',
+        '/api/brickognize?mode=figs'
+      ];
 
-      const response = await fetch('https://api.brickognize.com/predict/figs/', {
-        method: 'POST',
-        body: formData,
-        signal: controller.signal
-      });
+      let response: Response | null = null;
+      for (const endpoint of endpoints) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 3800);
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          if (res.ok) {
+            response = res;
+            break;
+          }
+        } catch {
+          // Intentar siguiente endpoint (proxy Hostinger PHP o Vercel Edge)
+        }
+      }
 
-      clearTimeout(timeoutId);
-
-      if (response.ok) {
+      if (response && response.ok) {
         const data = (await response.json()) as BrickognizeResponse;
         if (data.items && data.items.length > 0) {
           const candidates: RecognitionCandidate[] = data.items.slice(0, 12).map((item) => {
