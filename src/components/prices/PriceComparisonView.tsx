@@ -1,9 +1,11 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Check,
   ChevronDown,
   ExternalLink,
+  FolderPlus,
   Info,
+  Plus,
   PlusCircle,
   Search,
   TrendingUp
@@ -11,10 +13,13 @@ import {
 import type {
   MinifigCondition,
   MinifigureMetadata,
-  PreferredPriceSource
+  PreferredPriceSource,
+  UserCollection
 } from '../../types/minifig';
 import {
   ALL_MINIFIG_CATALOG,
+  createCustomMinifigMetadata,
+  findMinifigById,
   searchMinifigCatalog
 } from '../../data/catalogPresets';
 import {
@@ -27,10 +32,15 @@ interface PriceComparisonViewProps {
   selectedMinifig: MinifigureMetadata;
   selectedCondition: MinifigCondition;
   preferredPriceSource: PreferredPriceSource;
+  collections: UserCollection[];
+  activeCollectionId: string | null;
+  onSelectCollection: (id: string) => void;
+  onCreateCollection: (name: string) => Promise<UserCollection>;
   onChangePreferredSource: (source: PreferredPriceSource) => void;
   onChangeMinifig: (minifig: MinifigureMetadata) => void;
   onChangeCondition: (condition: MinifigCondition) => void;
   onAddToCollection: (params: {
+    collectionId?: string | null;
     minifig: MinifigureMetadata;
     condition: MinifigCondition;
     quantity: number;
@@ -44,6 +54,10 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
   selectedMinifig,
   selectedCondition,
   preferredPriceSource,
+  collections,
+  activeCollectionId,
+  onSelectCollection,
+  onCreateCollection,
   onChangePreferredSource,
   onChangeMinifig,
   onChangeCondition,
@@ -52,10 +66,35 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [quantityToAdd, setQuantityToAdd] = useState<number>(1);
   const [purchasePriceInput, setPurchasePriceInput] = useState<string>('');
+  const [marketPriceInput, setMarketPriceInput] = useState<string>('');
   const [notesInput, setNotesInput] = useState<string>('');
-  const [savedNotice, setSavedNotice] = useState<boolean>(false);
+  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+
+  const [targetCollectionId, setTargetCollectionId] = useState<string | null>(activeCollectionId);
+  const [creatingCollectionMode, setCreatingCollectionMode] = useState(false);
+  const [newCollectionName, setNewCollectionName] = useState('');
+
+  useEffect(() => {
+    setTargetCollectionId(activeCollectionId);
+  }, [activeCollectionId]);
 
   const searchResults = useMemo(() => searchMinifigCatalog(searchQuery), [searchQuery]);
+
+  const cleanTypedCode = useMemo(
+    () => searchQuery.trim().replace(/\s+/g, '').toLowerCase(),
+    [searchQuery]
+  );
+
+  const canQuoteCustomCode = useMemo(() => {
+    if (cleanTypedCode.length < 2) return false;
+    return !findMinifigById(cleanTypedCode);
+  }, [cleanTypedCode]);
+
+  const displayedPills = useMemo(() => {
+    const base = searchResults.length > 0 ? searchResults : ALL_MINIFIG_CATALOG;
+    const selectedAlreadyVisible = base.some((m) => m.figId === selectedMinifig.figId);
+    return selectedAlreadyVisible ? base : [selectedMinifig, ...base];
+  }, [searchResults, selectedMinifig]);
 
   const report = useMemo(
     () =>
@@ -66,6 +105,10 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
       ),
     [selectedMinifig, selectedCondition, preferredPriceSource]
   );
+
+  useEffect(() => {
+    setMarketPriceInput(report.estimatedMarketValueEur.toFixed(2));
+  }, [selectedMinifig.figId, selectedCondition, report.estimatedMarketValueEur]);
 
   const dualPrices = useMemo(
     () => getQuickDualPricesEur(selectedMinifig, preferredPriceSource),
@@ -90,45 +133,111 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
     );
   }, [partsSumEur, report.estimatedMarketValueEur]);
 
+  const handleSelectCustomCode = (codeRaw: string) => {
+    const clean = codeRaw.trim().replace(/\s+/g, '');
+    if (!clean) return;
+    const resolved = findMinifigById(clean) ?? createCustomMinifigMetadata({ figId: clean });
+    onChangeMinifig(resolved);
+    setSearchQuery('');
+  };
+
+  const handleCreateTargetCollection = async (e?: React.SyntheticEvent) => {
+    e?.preventDefault();
+    const trimmed = newCollectionName.trim();
+    if (!trimmed) return;
+    const created = await onCreateCollection(trimmed);
+    setTargetCollectionId(created.id);
+    setNewCollectionName('');
+    setCreatingCollectionMode(false);
+  };
+
+  const resolvedMarketValueEur = useMemo(() => {
+    const parsed = Number(marketPriceInput.replace(',', '.'));
+    if (marketPriceInput.trim() !== '' && Number.isFinite(parsed) && parsed > 0) {
+      return Math.round(parsed * 100) / 100;
+    }
+    return report.estimatedMarketValueEur;
+  }, [marketPriceInput, report.estimatedMarketValueEur]);
+
+  const targetCollectionName = useMemo(() => {
+    const found = collections.find((c) => c.id === targetCollectionId) ?? collections[0];
+    return found ? found.name : 'Mi Colección';
+  }, [collections, targetCollectionId]);
+
   const handleConfirmAdd = (e: React.FormEvent) => {
     e.preventDefault();
     const parsedPurchase =
       purchasePriceInput.trim() !== ''
-        ? Math.max(0, Number(purchasePriceInput))
-        : Math.round(report.estimatedMarketValueEur * 0.8 * 100) / 100;
+        ? Math.max(0, Number(purchasePriceInput.replace(',', '.')) || 0)
+        : Math.round(resolvedMarketValueEur * 0.8 * 100) / 100;
+
+    const updatedMinifig: MinifigureMetadata =
+      Math.abs(resolvedMarketValueEur - report.estimatedMarketValueEur) > 0.01
+        ? {
+            ...selectedMinifig,
+            baseMarketPriceEur: {
+              ...selectedMinifig.baseMarketPriceEur,
+              [selectedCondition]: resolvedMarketValueEur
+            },
+            isEstimatedFallbackPrice: false
+          }
+        : selectedMinifig;
 
     onAddToCollection({
-      minifig: selectedMinifig,
+      collectionId: targetCollectionId,
+      minifig: updatedMinifig,
       condition: selectedCondition,
       quantity: Math.max(1, quantityToAdd),
-      purchasePriceEur: parsedPurchase,
-      estimatedUnitValueEur: report.estimatedMarketValueEur,
+      purchasePriceEur: Math.round(parsedPurchase * 100) / 100,
+      estimatedUnitValueEur: resolvedMarketValueEur,
       notes: notesInput.trim() || undefined
     });
 
-    setSavedNotice(true);
+    onChangeMinifig(updatedMinifig);
+    setSavedNotice(`Guardada en «${targetCollectionName}»`);
     setNotesInput('');
-    setTimeout(() => setSavedNotice(false), 2600);
+    window.setTimeout(() => setSavedNotice(null), 2600);
   };
 
   return (
     <section className="screen-stack" aria-label="Comparador de precios multi-portal">
-      {/* Buscador Rápido */}
+      {/* Buscador Rápido + Cotizador Universal de Código */}
       <div className="surface-card">
-        <div className="search-bar-wrap">
+        <form
+          className="search-bar-wrap"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (searchResults.length === 1) {
+              onChangeMinifig(searchResults[0]);
+            } else if (canQuoteCustomCode) {
+              handleSelectCustomCode(cleanTypedCode);
+            }
+          }}
+        >
           <Search size={16} className="search-bar-icon" />
           <input
             type="search"
             id="comparator-search-input"
             className="search-input"
-            placeholder="Buscar código BrickLink (ej. sw0002, sh0232, col448) o nombre..."
+            placeholder="Busca o escribe cualquier código BrickLink (ej. sw0999, hp0128)..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
-        </div>
+        </form>
 
         <div className="catalog-pills-scroll" role="list">
-          {(searchResults.length > 0 ? searchResults : ALL_MINIFIG_CATALOG).map((item) => (
+          {canQuoteCustomCode && (
+            <button
+              type="button"
+              id="btn-quote-custom-code"
+              className="catalog-pill active"
+              onClick={() => handleSelectCustomCode(cleanTypedCode)}
+            >
+              <Plus size={12} />
+              <span>Cotizar «{cleanTypedCode.toUpperCase()}»</span>
+            </button>
+          )}
+          {displayedPills.map((item) => (
             <button
               key={item.figId}
               type="button"
@@ -210,17 +319,27 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
 
           <div className="best-deals-col">
             <div>
-              <span className="eyebrow" style={{ display: 'block' }}>Mejor compra</span>
+              <span className="eyebrow" style={{ display: 'block' }}>
+                Mejor compra
+              </span>
               <strong className="mono" style={{ color: 'var(--positive)' }}>
                 {report.bestDealPortal.toUpperCase()}
               </strong>
             </div>
             <div>
-              <span className="eyebrow" style={{ display: 'block' }}>Mayor venta</span>
+              <span className="eyebrow" style={{ display: 'block' }}>
+                Mayor venta
+              </span>
               <strong className="mono">{report.bestSalePortal.toUpperCase()}</strong>
             </div>
           </div>
         </div>
+
+        {selectedMinifig.isEstimatedFallbackPrice && (
+          <p className="section-hint" style={{ marginTop: 6, color: 'var(--accent)' }}>
+            Referencia externa con precio base orientativo. Consulta los enlaces reales y ajusta el valor debajo antes de guardarla.
+          </p>
+        )}
 
         <div className="source-select-row">
           <label htmlFor="preferred-price-source-select" className="eyebrow">
@@ -331,7 +450,7 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
         <div className="data-transparency-note">
           <Info size={14} style={{ flexShrink: 0, marginTop: 2 }} />
           <span>
-            Los enlaces «Abrir» ejecutan búsquedas reales en cada portal. Las cifras de prueba usan referencias de catálogo hasta configurar claves OAuth/API en proxy backend.
+            Los enlaces «Abrir» buscan directamente {selectedMinifig.figId.toUpperCase()} en cada portal real.
           </span>
         </div>
       </div>
@@ -353,7 +472,9 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
                     partsSumEur - report.estimatedMarketValueEur
                   ).toFixed(2)} €)`
                 : `Mejor vender completa (${
-                    partOutDiffPct >= 0 ? `+${partOutDiffPct.toFixed(1)}%` : `${partOutDiffPct.toFixed(1)}%`
+                    partOutDiffPct >= 0
+                      ? `+${partOutDiffPct.toFixed(1)}%`
+                      : `${partOutDiffPct.toFixed(1)}%`
                   } en piezas)`}
             </div>
             {selectedMinifig.parts.map((part) => (
@@ -371,14 +492,78 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
         </details>
       </div>
 
+      {/* Guardar en Colección Destino */}
       <form className="surface-card" onSubmit={handleConfirmAdd}>
         <div className="section-header-line">
-          <h3 className="section-title">Registrar {selectedMinifig.figId.toUpperCase()} en Mi Colección</h3>
+          <h3 className="section-title">
+            Guardar {selectedMinifig.figId.toUpperCase()} en colección
+          </h3>
         </div>
 
-        <div className="form-grid-2">
+        <div className="target-collection-row" style={{ marginBottom: 10 }}>
+          <label htmlFor="comp-target-col" className="eyebrow">
+            Colección destino
+          </label>
+          <div className="target-collection-controls">
+            {collections.length > 0 ? (
+              <select
+                id="comp-target-col"
+                className="source-select-mini"
+                value={targetCollectionId ?? collections[0].id}
+                onChange={(e) => {
+                  setTargetCollectionId(e.target.value);
+                  onSelectCollection(e.target.value);
+                }}
+              >
+                {collections.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                    {c.isDemo ? ' (Prueba)' : ''}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <span className="section-hint">Se creará «Mi Colección»</span>
+            )}
+            <button
+              type="button"
+              className="btn-chip"
+              onClick={() => setCreatingCollectionMode((v) => !v)}
+            >
+              <FolderPlus size={12} />
+              <span>Nueva</span>
+            </button>
+          </div>
+
+          {creatingCollectionMode && (
+            <div className="inline-create-bar">
+              <input
+                type="text"
+                className="field-input"
+                placeholder="Nombre de tu colección..."
+                value={newCollectionName}
+                onChange={(e) => setNewCollectionName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    void handleCreateTargetCollection(e);
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="btn-chip active"
+                onClick={(e) => void handleCreateTargetCollection(e)}
+              >
+                Crear
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="form-grid-3">
           <div className="field-group" style={{ marginBottom: 0 }}>
-            <label htmlFor="add-qty-input">Cantidad (uds.)</label>
+            <label htmlFor="add-qty-input">Cantidad</label>
             <input
               id="add-qty-input"
               type="number"
@@ -391,16 +576,29 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
           </div>
 
           <div className="field-group" style={{ marginBottom: 0 }}>
-            <label htmlFor="add-paid-input">Precio pagado / ud. (€)</label>
+            <label htmlFor="add-paid-input">Pagado / ud. (€)</label>
             <input
               id="add-paid-input"
               type="number"
               className="field-input mono"
               step="0.01"
               min={0}
-              placeholder={`${(report.estimatedMarketValueEur * 0.8).toFixed(2)}`}
+              placeholder={`${(resolvedMarketValueEur * 0.8).toFixed(2)}`}
               value={purchasePriceInput}
               onChange={(e) => setPurchasePriceInput(e.target.value)}
+            />
+          </div>
+
+          <div className="field-group" style={{ marginBottom: 0 }}>
+            <label htmlFor="add-market-input">Valor / ud. (€)</label>
+            <input
+              id="add-market-input"
+              type="number"
+              className="field-input mono"
+              step="0.01"
+              min={0.5}
+              value={marketPriceInput}
+              onChange={(e) => setMarketPriceInput(e.target.value)}
             />
           </div>
         </div>
@@ -420,14 +618,15 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
         {savedNotice && (
           <div className="feedback-banner" role="status" style={{ marginBottom: 10 }}>
             <Check size={16} />
-            <span>Guardada en Mi Colección y recalculado el total</span>
+            <span>{savedNotice}</span>
           </div>
         )}
 
         <button type="submit" id="btn-submit-add-collection" className="btn-primary btn-full">
           <PlusCircle size={16} />
           <span>
-            Guardar en Colección ({(quantityToAdd * report.estimatedMarketValueEur).toFixed(2)} €)
+            Guardar en «{targetCollectionName}» (
+            {(quantityToAdd * resolvedMarketValueEur).toFixed(2)} €)
           </span>
         </button>
       </form>

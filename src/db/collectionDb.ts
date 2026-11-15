@@ -8,11 +8,12 @@ import type {
   PortfolioHistoryPoint,
   PortfolioTimeRange,
   PreferredPriceSource,
-  ThemeAllocation
+  ThemeAllocation,
+  UserCollection
 } from '../types/minifig';
 import {
+  createCustomMinifigMetadata,
   findMinifigById,
-  makeMinimalFigAvatar,
   MINIFIG_CATALOG
 } from '../data/catalogPresets';
 import {
@@ -20,14 +21,57 @@ import {
   generatePriceComparisonReport
 } from '../services/priceAggregator';
 
+export const DEMO_COLLECTION_ID = 'col-demo';
+export const DEFAULT_USER_COLLECTION_NAME = 'Mi Colección';
+
+interface AppMetaRow {
+  key: string;
+  value: string;
+}
+
 export class BrickLensDatabase extends Dexie {
+  collections!: Table<UserCollection, string>;
   collectionItems!: Table<CollectionItem, string>;
+  appMeta!: Table<AppMetaRow, string>;
 
   constructor() {
     super('BrickLensCollectionDB');
     this.version(1).stores({
       collectionItems: 'id, minifig.figId, minifig.theme, condition, addedAtIso'
     });
+    this.version(2)
+      .stores({
+        collections: 'id, createdAtIso',
+        collectionItems:
+          'id, collectionId, minifig.figId, minifig.theme, condition, addedAtIso',
+        appMeta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const existingItems = (await tx
+          .table('collectionItems')
+          .toArray()) as Array<Partial<CollectionItem> & { id: string }>;
+        if (existingItems.length > 0) {
+          const now = new Date().toISOString();
+          await tx.table('collections').put({
+            id: DEMO_COLLECTION_ID,
+            name: 'Colección de prueba',
+            isDemo: true,
+            createdAtIso: now,
+            updatedAtIso: now
+          });
+          for (const item of existingItems) {
+            if (!item.collectionId) {
+              await tx
+                .table('collectionItems')
+                .update(item.id, { collectionId: DEMO_COLLECTION_ID });
+            }
+          }
+          await tx.table('appMeta').put({ key: 'demoSeeded', value: 'true' });
+          await tx
+            .table('appMeta')
+            .put({ key: 'activeCollectionId', value: DEMO_COLLECTION_ID });
+        }
+      });
   }
 }
 
@@ -46,7 +90,7 @@ function escapeXml(value: string): string {
 }
 
 /**
- * Calcula las métricas financieras consolidadas de la colección:
+ * Calcula las métricas financieras consolidadas de una colección:
  * Valor Total de Mercado (€), Total Invertido (€), Plusvalía Neta (€ y %),
  * la pieza más valiosa (Top Grail) y la distribución porcentual por temática LEGO.
  */
@@ -111,15 +155,7 @@ export function calculateCollectionStats(items: CollectionItem[]): CollectionSta
   };
 }
 
-/**
- * Semilla inicial para pruebas rápidas (solicitado por el usuario para facilitar el testing del MVP).
- */
-export async function ensureDemoCollectionSeeded(): Promise<CollectionItem[]> {
-  const count = await db.collectionItems.count();
-  if (count > 0) {
-    return db.collectionItems.toArray();
-  }
-
+function buildDemoSeedItems(collectionId: string): CollectionItem[] {
   const now = new Date().toISOString();
   const initialSeeds: Array<{
     minifig: MinifigureMetadata;
@@ -133,35 +169,36 @@ export async function ensureDemoCollectionSeeded(): Promise<CollectionItem[]> {
       condition: 'used_complete',
       quantity: 3,
       purchasePriceEur: 5.5,
-      notes: 'Lote ejército imperial comprado en Wallapop'
+      notes: 'Ejemplo: lote imperial comprado en Wallapop'
     },
     {
       minifig: MINIFIG_CATALOG[2], // sh0232 Iron Man Silver Centurion
       condition: 'new',
       quantity: 1,
       purchasePriceEur: 42.0,
-      notes: 'Polybag promocional sellado de fábrica'
+      notes: 'Ejemplo: polybag promocional sellado'
     },
     {
       minifig: MINIFIG_CATALOG[3], // njo0070 Lloyd ZX Golden Ninja
       condition: 'used_complete',
       quantity: 1,
       purchasePriceEur: 12.0,
-      notes: 'Incluye katana dorada y hombreras originales'
+      notes: 'Ejemplo: completa con katana dorada'
     },
     {
       minifig: MINIFIG_CATALOG[5], // sp0002 Classic Space Blue Astronaut
       condition: 'used_complete',
       quantity: 1,
       purchasePriceEur: 16.5,
-      notes: 'Logo dorado en torso 9/10, casco sin rotura'
+      notes: 'Ejemplo: logo dorado intacto'
     }
   ];
 
-  const items: CollectionItem[] = initialSeeds.map((seed, idx) => {
+  return initialSeeds.map((seed, idx) => {
     const report = generatePriceComparisonReport(seed.minifig, seed.condition);
     return {
-      id: `item-${seed.minifig.figId}-${seed.condition}-${idx}`,
+      id: `item-${collectionId}-${seed.minifig.figId}-${seed.condition}-${idx}`,
+      collectionId,
       minifig: seed.minifig,
       condition: seed.condition,
       quantity: seed.quantity,
@@ -172,12 +209,174 @@ export async function ensureDemoCollectionSeeded(): Promise<CollectionItem[]> {
       addedAtIso: now
     };
   });
+}
 
-  await db.collectionItems.bulkPut(items);
+/**
+ * Inicializa las colecciones del usuario.
+ * La "Colección de prueba" se crea SOLO en el primer arranque: si el usuario la elimina,
+ * no vuelve a aparecer automáticamente al recargar la app.
+ */
+export async function initializeCollections(): Promise<{
+  collections: UserCollection[];
+  activeCollectionId: string | null;
+  allItems: CollectionItem[];
+}> {
+  const existingCollections = await db.collections.orderBy('createdAtIso').toArray();
+  const demoSeededMeta = await db.appMeta.get('demoSeeded');
+
+  if (!demoSeededMeta && existingCollections.length === 0) {
+    const now = new Date().toISOString();
+    const demoCollection: UserCollection = {
+      id: DEMO_COLLECTION_ID,
+      name: 'Colección de prueba',
+      isDemo: true,
+      createdAtIso: now,
+      updatedAtIso: now
+    };
+    const seedItems = buildDemoSeedItems(DEMO_COLLECTION_ID);
+    await db.transaction('rw', db.collections, db.collectionItems, db.appMeta, async () => {
+      await db.collections.put(demoCollection);
+      await db.collectionItems.bulkPut(seedItems);
+      await db.appMeta.put({ key: 'demoSeeded', value: 'true' });
+      await db.appMeta.put({ key: 'activeCollectionId', value: DEMO_COLLECTION_ID });
+    });
+
+    return {
+      collections: [demoCollection],
+      activeCollectionId: DEMO_COLLECTION_ID,
+      allItems: seedItems
+    };
+  }
+
+  const allItems = await db.collectionItems.toArray();
+  const savedActiveMeta = await db.appMeta.get('activeCollectionId');
+  const savedActiveId = savedActiveMeta?.value;
+  const activeCollectionId =
+    existingCollections.find((c) => c.id === savedActiveId)?.id ??
+    existingCollections[0]?.id ??
+    null;
+
+  return {
+    collections: existingCollections,
+    activeCollectionId,
+    allItems
+  };
+}
+
+export async function setActiveCollectionId(collectionId: string | null): Promise<void> {
+  if (collectionId) {
+    await db.appMeta.put({ key: 'activeCollectionId', value: collectionId });
+  } else {
+    await db.appMeta.delete('activeCollectionId');
+  }
+}
+
+export async function createCollection(
+  name: string,
+  options?: { isDemo?: boolean; id?: string }
+): Promise<UserCollection> {
+  const cleanName = name.trim() || DEFAULT_USER_COLLECTION_NAME;
+  const now = new Date().toISOString();
+  const created: UserCollection = {
+    id: options?.id || `col-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    name: cleanName,
+    isDemo: options?.isDemo,
+    createdAtIso: now,
+    updatedAtIso: now
+  };
+  await db.collections.put(created);
+  await db.appMeta.put({ key: 'activeCollectionId', value: created.id });
+  return created;
+}
+
+export async function renameCollection(collectionId: string, newName: string): Promise<void> {
+  const clean = newName.trim();
+  if (!clean) return;
+  await db.collections.update(collectionId, {
+    name: clean,
+    updatedAtIso: new Date().toISOString()
+  });
+}
+
+export async function deleteCollection(collectionId: string): Promise<string | null> {
+  let nextActiveId: string | null = null;
+  await db.transaction('rw', db.collections, db.collectionItems, db.appMeta, async () => {
+    await db.collectionItems.where('collectionId').equals(collectionId).delete();
+    await db.collections.delete(collectionId);
+    // Marcar demoSeeded para evitar que borrar la colección de prueba la vuelva a crear al recargar
+    await db.appMeta.put({ key: 'demoSeeded', value: 'true' });
+
+    const remaining = await db.collections.orderBy('createdAtIso').toArray();
+    nextActiveId = remaining[0]?.id ?? null;
+    if (nextActiveId) {
+      await db.appMeta.put({ key: 'activeCollectionId', value: nextActiveId });
+    } else {
+      await db.appMeta.delete('activeCollectionId');
+    }
+  });
+  return nextActiveId;
+}
+
+export async function restoreDemoCollection(): Promise<{
+  collection: UserCollection;
+  items: CollectionItem[];
+}> {
+  const now = new Date().toISOString();
+  const demoCollection: UserCollection = {
+    id: DEMO_COLLECTION_ID,
+    name: 'Colección de prueba',
+    isDemo: true,
+    createdAtIso: now,
+    updatedAtIso: now
+  };
+  const seedItems = buildDemoSeedItems(DEMO_COLLECTION_ID);
+
+  await db.transaction('rw', db.collections, db.collectionItems, db.appMeta, async () => {
+    await db.collectionItems.where('collectionId').equals(DEMO_COLLECTION_ID).delete();
+    await db.collections.put(demoCollection);
+    await db.collectionItems.bulkPut(seedItems);
+    await db.appMeta.put({ key: 'demoSeeded', value: 'true' });
+    await db.appMeta.put({ key: 'activeCollectionId', value: DEMO_COLLECTION_ID });
+  });
+
+  return { collection: demoCollection, items: seedItems };
+}
+
+/**
+ * Mantiene compatibilidad directa para pruebas y restauración manual de ejemplos.
+ */
+export async function ensureDemoCollectionSeeded(): Promise<CollectionItem[]> {
+  const count = await db.collectionItems.where('collectionId').equals(DEMO_COLLECTION_ID).count();
+  if (count > 0) {
+    return db.collectionItems.where('collectionId').equals(DEMO_COLLECTION_ID).toArray();
+  }
+  const { items } = await restoreDemoCollection();
   return items;
 }
 
+async function resolveTargetCollectionId(requestedId?: string | null): Promise<string> {
+  if (requestedId) {
+    const found = await db.collections.get(requestedId);
+    if (found) return found.id;
+  }
+
+  const activeMeta = await db.appMeta.get('activeCollectionId');
+  if (activeMeta?.value) {
+    const found = await db.collections.get(activeMeta.value);
+    if (found) return found.id;
+  }
+
+  const first = await db.collections.orderBy('createdAtIso').first();
+  if (first) return first.id;
+
+  // Si el usuario borró todas las colecciones y escanea/añade una figura nueva, creamos "Mi Colección"
+  const created = await createCollection(DEFAULT_USER_COLLECTION_NAME);
+  await db.appMeta.put({ key: 'demoSeeded', value: 'true' });
+  return created.id;
+}
+
 export async function upsertCollectionMinifig(params: {
+  collectionId?: string | null;
   minifig: MinifigureMetadata;
   condition: MinifigCondition;
   quantity: number;
@@ -185,7 +384,11 @@ export async function upsertCollectionMinifig(params: {
   estimatedUnitValueEur?: number;
   notes?: string;
 }): Promise<CollectionItem> {
+  const targetCollectionId = await resolveTargetCollectionId(params.collectionId);
+
   const existing = await db.collectionItems
+    .where('collectionId')
+    .equals(targetCollectionId)
     .filter(
       (item) =>
         item.minifig.figId === params.minifig.figId && item.condition === params.condition
@@ -214,11 +417,13 @@ export async function upsertCollectionMinifig(params: {
       missingPartsNotes: params.notes || existing.missingPartsNotes
     };
     await db.collectionItems.put(updated);
+    await db.collections.update(targetCollectionId, { updatedAtIso: now });
     return updated;
   }
 
   const created: CollectionItem = {
-    id: `item-${params.minifig.figId}-${params.condition}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    id: `item-${targetCollectionId}-${params.minifig.figId}-${params.condition}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    collectionId: targetCollectionId,
     minifig: params.minifig,
     condition: params.condition,
     quantity: params.quantity,
@@ -230,14 +435,18 @@ export async function upsertCollectionMinifig(params: {
   };
 
   await db.collectionItems.put(created);
+  await db.collections.update(targetCollectionId, { updatedAtIso: now });
   return created;
 }
 
 export async function bulkUpsertCollectionItems(
-  lines: BulkImportParsedLine[]
+  lines: BulkImportParsedLine[],
+  collectionId?: string | null
 ): Promise<CollectionItem[]> {
+  const targetCollectionId = await resolveTargetCollectionId(collectionId);
   for (const line of lines) {
     await upsertCollectionMinifig({
+      collectionId: targetCollectionId,
       minifig: line.minifig,
       condition: line.condition,
       quantity: line.quantity,
@@ -246,7 +455,7 @@ export async function bulkUpsertCollectionItems(
       notes: line.notes
     });
   }
-  return db.collectionItems.toArray();
+  return db.collectionItems.where('collectionId').equals(targetCollectionId).toArray();
 }
 
 export function exportCollectionToCsv(items: CollectionItem[]): string {
@@ -344,38 +553,21 @@ function buildSyntheticExternalMinifig(params: {
   const existing = findMinifigById(params.figId);
   if (existing) return existing;
 
-  const base = Math.max(2.0, params.unitPriceEur || 10.0);
+  const base = params.unitPriceEur && params.unitPriceEur > 0 ? params.unitPriceEur : 10.0;
   const estUsed =
     params.condition === 'new'
       ? roundEur(base * 0.72)
       : params.condition === 'used_incomplete'
       ? roundEur(base * 1.45)
       : roundEur(base);
-  const estNew = roundEur(estUsed * 1.38);
 
-  return {
-    figId: params.figId.toLowerCase(),
-    rebrickableId: `fig-${params.figId.toLowerCase()}`,
+  return createCustomMinifigMetadata({
+    figId: params.figId,
     name: params.name || `Minifigura BrickLink ${params.figId.toUpperCase()}`,
-    theme: params.theme || 'LEGO System',
-    yearReleased: 2020,
-    numParts: 4,
-    rarity: estUsed >= 35 ? 'rare' : estUsed >= 12 ? 'uncommon' : 'common',
-    imageUrl: makeMinimalFigAvatar(params.figId, '#1b1f29', '#475569', '#fbbf24'),
-    appearsInSets: 1,
-    sampleSetCode: 'Importado XML/BSX',
-    distinguishingFeatures: [`Código importado: ${params.figId}`],
-    parts: [
-      { partNum: `${params.figId}-h`, name: 'Cabeza / Casco', category: 'head', avgPriceEur: roundEur(estUsed * 0.35) },
-      { partNum: `${params.figId}-t`, name: 'Torso Impreso', category: 'torso', avgPriceEur: roundEur(estUsed * 0.4) },
-      { partNum: `${params.figId}-l`, name: 'Piernas', category: 'legs', avgPriceEur: roundEur(estUsed * 0.25) }
-    ],
-    baseMarketPriceEur: {
-      new: estNew,
-      used_complete: estUsed,
-      used_incomplete: roundEur(estUsed * 0.55)
-    }
-  };
+    theme: params.theme,
+    usedEur: estUsed,
+    notes: `Código importado: ${params.figId}`
+  });
 }
 
 function extractXmlTag(block: string, tagName: string): string | undefined {

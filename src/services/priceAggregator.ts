@@ -9,8 +9,8 @@ import type {
 } from '../types/minifig';
 import {
   ALL_MINIFIG_CATALOG,
-  findMinifigById,
-  MINIFIG_CATALOG
+  createCustomMinifigMetadata,
+  findMinifigById
 } from '../data/catalogPresets';
 
 interface PortalMultiplierConfig {
@@ -174,7 +174,7 @@ export function generatePriceComparisonReport(
 ): PriceComparisonReport {
   const minifig: MinifigureMetadata =
     typeof figIdOrMeta === 'string'
-      ? findMinifigById(figIdOrMeta) ?? MINIFIG_CATALOG[0]
+      ? findMinifigById(figIdOrMeta) ?? createCustomMinifigMetadata({ figId: figIdOrMeta })
       : figIdOrMeta;
 
   const basePrice = minifig.baseMarketPriceEur[condition];
@@ -255,26 +255,16 @@ export function getQuickDualPricesEur(
   figIdOrMeta: string | MinifigureMetadata,
   preferredSource: PreferredPriceSource = 'weighted'
 ): { usedEur: number; newEur: number; incompleteEur: number } {
-  if (preferredSource === 'weighted') {
-    const minifig =
-      typeof figIdOrMeta === 'string'
-        ? findMinifigById(figIdOrMeta) ?? MINIFIG_CATALOG[0]
-        : figIdOrMeta;
-    return {
-      usedEur: generatePriceComparisonReport(minifig, 'used_complete', preferredSource)
-        .estimatedMarketValueEur,
-      newEur: generatePriceComparisonReport(minifig, 'new', preferredSource)
-        .estimatedMarketValueEur,
-      incompleteEur: generatePriceComparisonReport(minifig, 'used_incomplete', preferredSource)
-        .estimatedMarketValueEur
-    };
-  }
+  const minifig =
+    typeof figIdOrMeta === 'string'
+      ? findMinifigById(figIdOrMeta) ?? createCustomMinifigMetadata({ figId: figIdOrMeta })
+      : figIdOrMeta;
   return {
-    usedEur: generatePriceComparisonReport(figIdOrMeta, 'used_complete', preferredSource)
+    usedEur: generatePriceComparisonReport(minifig, 'used_complete', preferredSource)
       .estimatedMarketValueEur,
-    newEur: generatePriceComparisonReport(figIdOrMeta, 'new', preferredSource)
+    newEur: generatePriceComparisonReport(minifig, 'new', preferredSource)
       .estimatedMarketValueEur,
-    incompleteEur: generatePriceComparisonReport(figIdOrMeta, 'used_incomplete', preferredSource)
+    incompleteEur: generatePriceComparisonReport(minifig, 'used_incomplete', preferredSource)
       .estimatedMarketValueEur
   };
 }

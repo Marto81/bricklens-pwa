@@ -7,9 +7,11 @@ import type {
 } from '../types/minifig';
 import {
   ALL_MINIFIG_CATALOG,
+  createCustomMinifigMetadata,
   DEMO_BULK_LOT_IMAGE,
   DEMO_BULK_LOT_SLOTS,
   findMinifigById,
+  guessThemeFromFigId,
   MINIFIG_CATALOG
 } from '../data/catalogPresets';
 
@@ -28,6 +30,7 @@ interface BrickognizeResponse {
     upper: number;
     right: number;
     lower: number;
+    score?: number;
   };
   items?: BrickognizePredictionItem[];
 }
@@ -39,60 +42,84 @@ export interface NormalizedBox {
   height: number;
 }
 
+function resolveRawDimensions(source: HTMLVideoElement | HTMLImageElement): {
+  rawWidth: number;
+  rawHeight: number;
+} {
+  if (source instanceof HTMLVideoElement) {
+    if (source.readyState < 2 || source.videoWidth <= 0 || source.videoHeight <= 0) {
+      throw new Error(
+        'La cámara aún se está enfocando. Espera un instante e inténtalo de nuevo.'
+      );
+    }
+    return { rawWidth: source.videoWidth, rawHeight: source.videoHeight };
+  }
+
+  const rawWidth = source.naturalWidth || source.width || 0;
+  const rawHeight = source.naturalHeight || source.height || 0;
+  if (rawWidth <= 0 || rawHeight <= 0) {
+    throw new Error('No se pudo leer el tamaño de la imagen seleccionada.');
+  }
+  return { rawWidth, rawHeight };
+}
+
+async function encodeCanvasToJpeg(
+  canvas: HTMLCanvasElement,
+  quality = 0.88
+): Promise<{ blob: Blob; dataUrl: string }> {
+  const dataUrl = canvas.toDataURL('image/jpeg', quality);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error('Fallo al codificar la imagen en JPEG'))),
+      'image/jpeg',
+      quality
+    );
+  });
+  return { blob, dataUrl };
+}
+
 /**
- * Recorta el cuadrado central de un elemento <video> o <img> y lo comprime en WebP (<150 KB).
+ * Redimensiona manteniendo la relación de aspecto completa (sin recortar cabeza ni piernas)
+ * y codifica en JPEG (máxima compatibilidad iOS Safari + Android Chrome + Brickognize).
  */
 export async function preprocessImageSourceToBlob(
   source: HTMLVideoElement | HTMLImageElement,
-  targetSize = 720
+  maxDimension = 840
 ): Promise<{ blob: Blob; dataUrl: string }> {
+  const { rawWidth, rawHeight } = resolveRawDimensions(source);
+  const longest = Math.max(rawWidth, rawHeight);
+  const scale = Math.min(1, maxDimension / Math.max(1, longest));
+  const targetWidth = Math.max(120, Math.round(rawWidth * scale));
+  const targetHeight = Math.max(120, Math.round(rawHeight * scale));
+
   const canvas = document.createElement('canvas');
-  canvas.width = targetSize;
-  canvas.height = targetSize;
+  canvas.width = targetWidth;
+  canvas.height = targetHeight;
   const ctx = canvas.getContext('2d');
 
   if (!ctx) {
     throw new Error('No se pudo inicializar el contexto 2D del canvas');
   }
 
-  const rawWidth =
-    source instanceof HTMLVideoElement ? source.videoWidth || 640 : source.naturalWidth || 640;
-  const rawHeight =
-    source instanceof HTMLVideoElement ? source.videoHeight || 640 : source.naturalHeight || 640;
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, targetWidth, targetHeight);
+  ctx.drawImage(source, 0, 0, rawWidth, rawHeight, 0, 0, targetWidth, targetHeight);
 
-  const side = Math.min(rawWidth, rawHeight);
-  const sx = Math.floor((rawWidth - side) / 2);
-  const sy = Math.floor((rawHeight - side) / 2);
-
-  ctx.drawImage(source, sx, sy, side, side, 0, 0, targetSize, targetSize);
-
-  const dataUrl = canvas.toDataURL('image/webp', 0.84);
-  const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error('Fallo al codificar imagen en WebP'))),
-      'image/webp',
-      0.84
-    );
-  });
-
-  return { blob, dataUrl };
+  return encodeCanvasToJpeg(canvas, 0.88);
 }
 
 /**
- * Convierte un <video> o <img> completo (sin recorte cuadrado) a WebP para vista de lote.
+ * Convierte un <video> o <img> completo (sin recorte cuadrado) a JPEG para vista y escaneo de lote.
  */
-export async function encodeFullFrameToWebP(
+export async function encodeFullFrameToJpeg(
   source: HTMLVideoElement | HTMLImageElement,
-  maxWidth = 960
+  maxWidth = 1080
 ): Promise<{ blob: Blob; dataUrl: string; aspectRatio: number }> {
-  const rawWidth =
-    source instanceof HTMLVideoElement ? source.videoWidth || 960 : source.naturalWidth || 960;
-  const rawHeight =
-    source instanceof HTMLVideoElement ? source.videoHeight || 640 : source.naturalHeight || 640;
+  const { rawWidth, rawHeight } = resolveRawDimensions(source);
 
   const scale = Math.min(1, maxWidth / Math.max(1, rawWidth));
-  const width = Math.max(120, Math.round(rawWidth * scale));
-  const height = Math.max(120, Math.round(rawHeight * scale));
+  const width = Math.max(160, Math.round(rawWidth * scale));
+  const height = Math.max(160, Math.round(rawHeight * scale));
   const aspectRatio = Math.round((rawWidth / Math.max(1, rawHeight)) * 1000) / 1000;
 
   const canvas = document.createElement('canvas');
@@ -104,30 +131,22 @@ export async function encodeFullFrameToWebP(
   }
   ctx.drawImage(source, 0, 0, width, height);
 
-  const dataUrl = canvas.toDataURL('image/webp', 0.82);
-  const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error('Fallo al codificar lote en WebP'))),
-      'image/webp',
-      0.82
-    );
-  });
-
+  const { blob, dataUrl } = await encodeCanvasToJpeg(canvas, 0.86);
   return { blob, dataUrl, aspectRatio };
 }
 
+// Alias mantenido por compatibilidad de importaciones
+export const encodeFullFrameToWebP = encodeFullFrameToJpeg;
+
 /**
- * Recorta una región normalizada (x, y, width, height en [0..1]) en formato WebP.
+ * Recorta una región normalizada (x, y, width, height en [0..1]) y la codifica en JPEG.
  */
 export async function cropNormalizedRegion(
   source: HTMLVideoElement | HTMLImageElement,
   box: NormalizedBox,
-  outputSize = 360
+  outputSize = 420
 ): Promise<{ blob: Blob; dataUrl: string }> {
-  const rawWidth =
-    source instanceof HTMLVideoElement ? source.videoWidth || 960 : source.naturalWidth || 960;
-  const rawHeight =
-    source instanceof HTMLVideoElement ? source.videoHeight || 640 : source.naturalHeight || 640;
+  const { rawWidth, rawHeight } = resolveRawDimensions(source);
 
   const sx = Math.max(0, Math.round(box.x * rawWidth));
   const sy = Math.max(0, Math.round(box.y * rawHeight));
@@ -153,22 +172,12 @@ export async function cropNormalizedRegion(
 
   ctx.drawImage(source, sx, sy, sw, sh, dx, dy, dw, dh);
 
-  const dataUrl = canvas.toDataURL('image/webp', 0.8);
-  const blob = await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error('Fallo al codificar recorte WebP'))),
-      'image/webp',
-      0.8
-    );
-  });
-
-  return { blob, dataUrl };
+  return encodeCanvasToJpeg(canvas, 0.86);
 }
 
 /**
  * Detecta zonas activas con minifiguras sobre un fondo relativamente uniforme mediante
- * energía de borde y contraste local en una rejilla ligera. Si la imagen es densa o uniforme,
- * devuelve una cuadrícula equilibrada (3x2 o 2x2).
+ * energía de borde y contraste local en una rejilla ligera.
  */
 export function detectBulkRegionsFromSource(
   source: HTMLVideoElement | HTMLImageElement,
@@ -197,7 +206,6 @@ export function detectBulkRegionsFromSource(
     ctx.drawImage(source, 0, 0, sampleW, sampleH);
     const { data } = ctx.getImageData(0, 0, sampleW, sampleH);
 
-    // Luminancia promedio de borde como referencia de fondo
     let bgLumSum = 0;
     let bgCount = 0;
     for (let x = 0; x < sampleW; x++) {
@@ -240,7 +248,6 @@ export function detectBulkRegionsFromSource(
       }
     }
 
-    // Connected components sobre la rejilla 8x12
     const visited: boolean[][] = Array.from({ length: gridRows }, () =>
       Array(gridCols).fill(false)
     );
@@ -317,52 +324,21 @@ export function detectBulkRegionsFromSource(
   }
 }
 
-function buildFallbackMinifigFromBrickognize(item: BrickognizePredictionItem): MinifigureMetadata {
+function buildMetadataFromBrickognize(item: BrickognizePredictionItem): MinifigureMetadata {
   const existing = findMinifigById(item.id);
   if (existing) return existing;
 
-  const themeGuess = item.id.startsWith('sw')
-    ? 'Star Wars'
-    : item.id.startsWith('sh')
-    ? 'Marvel / DC Super Heroes'
-    : item.id.startsWith('hp')
-    ? 'Harry Potter'
-    : item.id.startsWith('njo')
-    ? 'Ninjago'
-    : item.id.startsWith('col') || item.id.startsWith('dnd')
-    ? 'Collectible Minifigures'
-    : 'LEGO System';
-
-  return {
+  return createCustomMinifigMetadata({
     figId: item.id,
-    rebrickableId: `fig-${item.id}`,
-    name: item.name || `Minifigura LEGO (${item.id})`,
-    theme: themeGuess,
-    yearReleased: 2018,
-    numParts: 4,
-    rarity: 'uncommon',
-    imageUrl: item.img_url || '/samples/sw0585.jpg',
-    appearsInSets: 2,
-    sampleSetCode: 'Catálogo Oficial BrickLink',
-    distinguishingFeatures: [
-      `Identificado por Brickognize ML con código ${item.id}`,
-      'Patrón de torso y cabezal verificado en catálogo'
-    ],
-    parts: [
-      { partNum: `${item.id}-h`, name: 'Casco / Accesorio Superior', category: 'headgear', avgPriceEur: 3.5 },
-      { partNum: `${item.id}-t`, name: 'Torso Impreso Oficial', category: 'torso', avgPriceEur: 4.8 },
-      { partNum: `${item.id}-l`, name: 'Ensamblaje de Piernas', category: 'legs', avgPriceEur: 3.2 }
-    ],
-    baseMarketPriceEur: {
-      new: 16.5,
-      used_complete: 11.2,
-      used_incomplete: 6.4
-    }
-  };
+    name: item.name,
+    theme: item.category || guessThemeFromFigId(item.id),
+    imageUrl: item.img_url,
+    notes: `Identificada por Brickognize (${item.id.toUpperCase()})`
+  });
 }
 
 /**
- * Construye candidatos realistas (hasta 12 alternativas) cuando se escanea una muestra o en modo híbrido local.
+ * Construye candidatos cuando se ejecuta explícitamente una muestra de demostración.
  */
 export function buildCandidatesForPreset(
   primaryFigId: string,
@@ -372,7 +348,6 @@ export function buildCandidatesForPreset(
   const primary = findMinifigById(primaryFigId) ?? ALL_MINIFIG_CATALOG[0];
   const others = ALL_MINIFIG_CATALOG.filter((m) => m.figId !== primary.figId);
 
-  // Ordenar por coincidencia de temática para priorizar variantes plausibles (p. ej. Clone/Troopers juntos)
   const sortedAlternates = [...others].sort((a, b) => {
     const aSameTheme = a.theme === primary.theme ? 1 : 0;
     const bSameTheme = b.theme === primary.theme ? 1 : 0;
@@ -385,7 +360,7 @@ export function buildCandidatesForPreset(
       minifig: primary,
       confidence: 0.94,
       matchedFeatures: primary.distinguishingFeatures.slice(0, 2),
-      source: 'brickognize_api',
+      source: 'local_vision_hybrid',
       boundingBox: { x: 0.14, y: 0.1, width: 0.72, height: 0.8 }
     }
   ];
@@ -406,97 +381,156 @@ export function buildCandidatesForPreset(
 }
 
 /**
- * Ejecuta el pipeline de identificación visual contra Brickognize API (/predict/figs/)
- * con fallback instantáneo al motor híbrido local (devolviendo hasta 12 candidatos).
+ * Ejecuta el pipeline real de identificación visual contra Brickognize API (/predict/figs/).
+ * Nunca oculta fallos reales devolviendo datos de prueba falsos (como sw0002).
  */
 export async function identifyMinifigureFromImage(options: {
   blob?: Blob;
   previewDataUrl: string;
   presetFigId?: string;
-  fallbackFigId?: string;
 }): Promise<RecognitionResult> {
   const startTime = performance.now();
   const scanId = `scan-${Date.now()}`;
 
-  // Si hay blob de imagen real y no se forzó un preset específico, intentamos Brickognize API en vivo
-  if (options.blob && !options.presetFigId) {
+  // Caso explícito: el usuario pulsó "Probar ejemplo"
+  if (options.presetFigId) {
+    const candidates = buildCandidatesForPreset(options.presetFigId, 12);
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl || candidates[0].minifig.imageUrl,
+      latencyMs: Math.max(60, Math.round(performance.now() - startTime)),
+      apiSource: 'demo_preset',
+      candidates
+    };
+  }
+
+  if (!options.blob) {
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl,
+      latencyMs: Math.round(performance.now() - startTime),
+      apiSource: 'error',
+      errorMessage: 'No se recibió ninguna imagen válida para analizar.',
+      candidates: []
+    };
+  }
+
+  const endpoints = [
+    'https://api.brickognize.com/predict/figs/?top_k_items=12&min_similarity_items=0.2',
+    '/api/brickognize.php?mode=figs&top_k_items=12&min_similarity_items=0.2',
+    '/api/brickognize?mode=figs&top_k_items=12&min_similarity_items=0.2'
+  ];
+
+  const fileExtension = options.blob.type.includes('png')
+    ? 'minifig_scan.png'
+    : options.blob.type.includes('webp')
+    ? 'minifig_scan.webp'
+    : 'minifig_scan.jpg';
+
+  let parsedData: BrickognizeResponse | null = null;
+  let lastErrorDetail = '';
+
+  for (const endpoint of endpoints) {
+    const controller = new AbortController();
+    const timeoutMs = endpoint.startsWith('https://') ? 12000 : 8000;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
     try {
       const formData = new FormData();
-      formData.append('query_image', options.blob, 'minifig_scan.webp');
+      formData.append('query_image', options.blob, fileExtension);
 
-      const endpoints = [
-        'https://api.brickognize.com/predict/figs/',
-        '/api/brickognize.php?mode=figs',
-        '/api/brickognize?mode=figs'
-      ];
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+        body: formData,
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-      let response: Response | null = null;
-      for (const endpoint of endpoints) {
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 3800);
-          const res = await fetch(endpoint, {
-            method: 'POST',
-            body: formData,
-            signal: controller.signal
-          });
-          clearTimeout(timeoutId);
-          if (res.ok) {
-            response = res;
-            break;
-          }
-        } catch {
-          // Intentar siguiente endpoint (proxy Hostinger PHP o Vercel Edge)
-        }
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.ok) {
+        lastErrorDetail = `HTTP ${res.status}`;
+        continue;
+      }
+      if (!contentType.includes('application/json')) {
+        // Evitar confundir el fallback HTML de una SPA estática con respuesta válida de proxy
+        lastErrorDetail = 'Endpoint no devuelve JSON';
+        continue;
       }
 
-      if (response && response.ok) {
-        const data = (await response.json()) as BrickognizeResponse;
-        if (data.items && data.items.length > 0) {
-          const candidates: RecognitionCandidate[] = data.items.slice(0, 12).map((item) => {
-            const minifig = buildFallbackMinifigFromBrickognize(item);
-            return {
-              minifig,
-              confidence: Math.min(0.99, Math.max(0.15, Number(item.score) || 0.82)),
-              matchedFeatures: minifig.distinguishingFeatures.slice(0, 2),
-              source: 'brickognize_api'
-            };
-          });
-
-          return {
-            scanId,
-            capturedAtIso: new Date().toISOString(),
-            processedImageDataUrl: options.previewDataUrl,
-            latencyMs: Math.round(performance.now() - startTime),
-            apiSource: 'brickognize_live',
-            candidates
-          };
-        }
+      parsedData = (await res.json()) as BrickognizeResponse;
+      break;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err instanceof Error && err.name === 'AbortError') {
+        lastErrorDetail = 'Tiempo de espera agotado';
+      } else {
+        lastErrorDetail = err instanceof Error ? err.message : 'Error de red';
       }
-    } catch {
-      // Fallback transparente al clasificador híbrido local si no hay red o el proxy restringe el host
     }
   }
 
-  // Simulación realista de latencia de inferencia (180ms) para experiencia de escáner fluida
-  await new Promise((r) => setTimeout(r, 180));
-  const targetFigId = options.presetFigId || options.fallbackFigId || MINIFIG_CATALOG[0].figId;
-  const candidates = buildCandidatesForPreset(targetFigId, 12);
+  if (!parsedData) {
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl,
+      latencyMs: Math.round(performance.now() - startTime),
+      apiSource: 'error',
+      errorMessage: offline
+        ? 'Sin conexión a Internet. Conéctate para identificar figuras con Brickognize o añade tu código manualmente.'
+        : `No se pudo contactar con el servicio de reconocimiento (${lastErrorDetail || 'red'}). Inténtalo de nuevo o introduce el código manualmente.`,
+      candidates: []
+    };
+  }
+
+  const boxScore = parsedData.bounding_box?.score ?? 0;
+  const rawItems = parsedData.items ?? [];
+
+  if (rawItems.length === 0) {
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl,
+      latencyMs: Math.round(performance.now() - startTime),
+      apiSource: 'no_match',
+      detectedBoxScore: boxScore,
+      errorMessage:
+        boxScore >= 0.25
+          ? 'Se detectó una figura en la foto, pero no hubo coincidencia fiable. Prueba acercando más la cámara, con buena luz frontal y fondo liso.'
+          : 'No se detectó una minifigura LEGO clara en esta imagen. Colócala centrada de cuerpo entero sobre fondo liso.',
+      candidates: []
+    };
+  }
+
+  const candidates: RecognitionCandidate[] = rawItems.slice(0, 12).map((item) => {
+    const minifig = buildMetadataFromBrickognize(item);
+    return {
+      minifig,
+      confidence: Math.min(0.99, Math.max(0.1, Number(item.score) || 0.5)),
+      matchedFeatures: minifig.distinguishingFeatures.slice(0, 2),
+      source: 'brickognize_api'
+    };
+  });
 
   return {
     scanId,
     capturedAtIso: new Date().toISOString(),
-    processedImageDataUrl: options.previewDataUrl || candidates[0].minifig.imageUrl,
-    latencyMs: Math.max(140, Math.round(performance.now() - startTime)),
-    apiSource: 'hybrid_fallback',
+    processedImageDataUrl: options.previewDataUrl,
+    latencyMs: Math.round(performance.now() - startTime),
+    apiSource: 'brickognize_live',
+    detectedBoxScore: boxScore,
     candidates
   };
 }
 
 /**
- * Escáner de Lote (Bulk Scanner estilo brick'em):
- * Detecta/recorta cada región 1..N en una foto, identifica en paralelo con hasta 12 alternativas
- * y devuelve la sesión lista para añadir en bloque al inventario.
+ * Escáner de Lote (Bulk Scanner):
+ * Recorta regiones de la foto y consulta Brickognize en paralelo.
+ * En fotos reales nunca rellena huecos fallidos con figuras inventadas.
  */
 export async function identifyBulkLotFromImage(options: {
   sourceElement?: HTMLVideoElement | HTMLImageElement;
@@ -505,97 +539,132 @@ export async function identifyBulkLotFromImage(options: {
 }): Promise<BulkScanSession> {
   const startTime = performance.now();
   const sessionId = `bulk-${Date.now()}`;
-  const isDemo = options.isDemoLot || !options.sourceElement;
+  const isDemo = Boolean(options.isDemoLot);
 
-  const boxes = isDemo
-    ? DEMO_BULK_LOT_SLOTS.map((slot) => ({
+  if (isDemo) {
+    const demoItems: BulkScanDetectedItem[] = DEMO_BULK_LOT_SLOTS.map((slot) => {
+      const candidates = buildCandidatesForPreset(slot.figId, 12);
+      const primary = candidates[0].minifig;
+      return {
         slotIndex: slot.slotIndex,
         boundingBox: slot.boundingBox,
-        presetFigId: slot.figId
-      }))
-    : detectBulkRegionsFromSource(options.sourceElement!, 8).map((boundingBox, idx) => ({
-        slotIndex: idx + 1,
-        boundingBox,
-        presetFigId: undefined
-      }));
+        cropDataUrl: primary.imageUrl,
+        selectedMinifig: primary,
+        candidates,
+        condition: 'used_complete',
+        quantity: 1,
+        included: true
+      };
+    });
 
+    return {
+      sessionId,
+      capturedAtIso: new Date().toISOString(),
+      sourceImageDataUrl: options.previewDataUrl || DEMO_BULK_LOT_IMAGE,
+      aspectRatio: 1.5,
+      latencyMs: Math.max(120, Math.round(performance.now() - startTime)),
+      apiSource: 'demo_preset',
+      items: demoItems
+    };
+  }
+
+  if (!options.sourceElement) {
+    return {
+      sessionId,
+      capturedAtIso: new Date().toISOString(),
+      sourceImageDataUrl: options.previewDataUrl || '',
+      aspectRatio: 1.5,
+      latencyMs: Math.round(performance.now() - startTime),
+      apiSource: 'error',
+      errorMessage: 'No se encontró la imagen del lote para analizar.',
+      items: []
+    };
+  }
+
+  const boxes = detectBulkRegionsFromSource(options.sourceElement, 8);
   const items: BulkScanDetectedItem[] = [];
-  let liveHits = 0;
+  let errorCount = 0;
+  let lastErrorMessage = '';
 
-  // Ejecutar identificación por lotes con concurrencia controlada (3 a la vez)
   const batchSize = 3;
   for (let i = 0; i < boxes.length; i += batchSize) {
     const slice = boxes.slice(i, i + batchSize);
     const batchResults = await Promise.all(
-      slice.map(async (entry, innerIdx) => {
-        const globalIdx = i + innerIdx;
+      slice.map(async (boundingBox, innerIdx) => {
+        const slotNumber = i + innerIdx + 1;
         let cropBlob: Blob | undefined;
         let cropUrl: string | undefined;
 
-        if (options.sourceElement) {
-          try {
-            const cropped = await cropNormalizedRegion(options.sourceElement, entry.boundingBox, 320);
-            cropBlob = cropped.blob;
-            cropUrl = cropped.dataUrl;
-          } catch {
-            cropUrl = undefined;
-          }
+        try {
+          const cropped = await cropNormalizedRegion(options.sourceElement!, boundingBox, 400);
+          cropBlob = cropped.blob;
+          cropUrl = cropped.dataUrl;
+        } catch {
+          cropUrl = undefined;
         }
-
-        const fallbackCatalogItem =
-          ALL_MINIFIG_CATALOG[(globalIdx + 6) % ALL_MINIFIG_CATALOG.length] ?? MINIFIG_CATALOG[0];
 
         const recognition = await identifyMinifigureFromImage({
           blob: cropBlob,
-          previewDataUrl: cropUrl || '',
-          presetFigId: isDemo ? entry.presetFigId : undefined,
-          fallbackFigId: fallbackCatalogItem.figId
+          previewDataUrl: cropUrl || ''
         });
 
-        if (recognition.apiSource === 'brickognize_live') {
-          liveHits++;
+        if (recognition.apiSource === 'brickognize_live' && recognition.candidates.length > 0) {
+          const primary = recognition.candidates[0].minifig;
+          return {
+            slotIndex: slotNumber,
+            boundingBox,
+            cropDataUrl: cropUrl || primary.imageUrl,
+            selectedMinifig: primary,
+            candidates: recognition.candidates,
+            condition: 'used_complete' as const,
+            quantity: 1,
+            included: true
+          };
         }
 
-        const primary = recognition.candidates[0]?.minifig ?? fallbackCatalogItem;
-
-        return {
-          slotIndex: entry.slotIndex,
-          boundingBox: entry.boundingBox,
-          cropDataUrl: cropUrl || primary.imageUrl,
-          selectedMinifig: primary,
-          candidates: recognition.candidates,
-          condition: 'used_complete' as const,
-          quantity: 1,
-          included: true
-        };
+        if (recognition.apiSource === 'error') {
+          errorCount++;
+          if (recognition.errorMessage) lastErrorMessage = recognition.errorMessage;
+        }
+        return null;
       })
     );
-    items.push(...batchResults);
+
+    for (const valid of batchResults) {
+      if (valid) items.push(valid);
+    }
   }
 
-  const sourceEl = options.sourceElement;
-  const sourceW = sourceEl
-    ? 'videoWidth' in sourceEl
-      ? sourceEl.videoWidth
-      : sourceEl.naturalWidth
-    : undefined;
-  const sourceH = sourceEl
-    ? 'videoHeight' in sourceEl
-      ? sourceEl.videoHeight
-      : sourceEl.naturalHeight
-    : undefined;
-  const aspectRatio =
-    sourceW && sourceH && sourceH > 0
-      ? Math.round((sourceW / sourceH) * 1000) / 1000
-      : 1.5;
+  // Re-numerar consecutivamente los ítems realmente detectados
+  const renumbered = items.map((item, idx) => ({
+    ...item,
+    slotIndex: idx + 1
+  }));
+
+  const { rawWidth, rawHeight } = resolveRawDimensions(options.sourceElement);
+  const aspectRatio = Math.round((rawWidth / Math.max(1, rawHeight)) * 1000) / 1000;
+
+  let apiSource: BulkScanSession['apiSource'] = 'brickognize_live';
+  let errorMessage: string | undefined;
+
+  if (renumbered.length === 0) {
+    apiSource = errorCount > 0 ? 'error' : 'no_match';
+    errorMessage =
+      errorCount > 0
+        ? lastErrorMessage || 'Error de conexión al analizar las figuras del lote.'
+        : 'No se reconocieron minifiguras individuales en el lote. Separa ligeramente las figuras sobre fondo liso con buena iluminación.';
+  }
 
   return {
     sessionId,
     capturedAtIso: new Date().toISOString(),
-    sourceImageDataUrl: options.previewDataUrl || DEMO_BULK_LOT_IMAGE,
+    sourceImageDataUrl: options.previewDataUrl || '',
     aspectRatio,
-    latencyMs: Math.max(210, Math.round(performance.now() - startTime)),
-    apiSource: liveHits > 0 ? 'brickognize_live' : 'hybrid_fallback',
-    items
+    latencyMs: Math.max(150, Math.round(performance.now() - startTime)),
+    apiSource,
+    errorMessage,
+    items: renumbered
   };
 }
+
+export { MINIFIG_CATALOG };

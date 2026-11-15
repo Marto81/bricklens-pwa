@@ -33,5 +33,8 @@ dist-ssr
 /.local
 /.npm
 /.cache
+/.config
 /upload
 /dev-dist
+/Marto81
+/Captura_de_pantalla*

@@ -32,6 +32,11 @@ export default async function handler(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const requestedMode = url.searchParams.get('mode') || 'figs';
     const mode = ALLOWED_MODES.has(requestedMode) ? requestedMode : 'figs';
+    const topK = Math.max(1, Math.min(50, Number(url.searchParams.get('top_k_items')) || 12));
+    const minSim = Math.max(
+      0.05,
+      Math.min(1, Number(url.searchParams.get('min_similarity_items')) || 0.2)
+    );
 
     const formData = await req.formData();
     const queryImage = formData.get('query_image');
@@ -46,12 +51,16 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     const upstreamForm = new FormData();
-    upstreamForm.append('query_image', queryImage, 'minifig_scan.webp');
+    upstreamForm.append('query_image', queryImage, 'minifig_scan.jpg');
 
-    const upstreamRes = await fetch(`https://api.brickognize.com/predict/${mode}/`, {
-      method: 'POST',
-      body: upstreamForm
-    });
+    const upstreamRes = await fetch(
+      `https://api.brickognize.com/predict/${mode}/?top_k_items=${topK}&min_similarity_items=${minSim}`,
+      {
+        method: 'POST',
+        body: upstreamForm,
+        headers: { accept: 'application/json' }
+      }
+    );
 
     const bodyText = await upstreamRes.text();
     return new Response(bodyText, {

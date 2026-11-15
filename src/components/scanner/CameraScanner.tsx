@@ -1,15 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Camera,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  FolderPlus,
   Grid,
   ImagePlus,
   Minus,
   MoreVertical,
   Plus,
   QrCode,
+  RotateCcw,
   Search,
   Sparkles,
   Zap
@@ -23,17 +26,19 @@ import type {
   PreferredPriceSource,
   RecognitionCandidate,
   RecognitionResult,
-  ScannerMode
+  ScannerMode,
+  UserCollection
 } from '../../types/minifig';
 import {
-  ALL_MINIFIG_CATALOG,
+  createCustomMinifigMetadata,
   DEMO_BULK_LOT_IMAGE,
+  findMinifigById,
   MINIFIG_CATALOG
 } from '../../data/catalogPresets';
 import { lookupCmfCode, SAMPLE_CMF_PRESETS } from '../../data/cmfCodes';
 import { getQuickDualPricesEur } from '../../services/priceAggregator';
 import {
-  encodeFullFrameToWebP,
+  encodeFullFrameToJpeg,
   identifyBulkLotFromImage,
   identifyMinifigureFromImage,
   preprocessImageSourceToBlob
@@ -41,14 +46,23 @@ import {
 
 interface CameraScannerProps {
   preferredPriceSource: PreferredPriceSource;
+  collections: UserCollection[];
+  activeCollectionId: string | null;
+  onSelectCollection: (id: string) => void;
+  onCreateCollection: (name: string) => Promise<UserCollection>;
   onSelectMinifigForComparison: (minifig: MinifigureMetadata, condition: MinifigCondition) => void;
   onQuickAddToCollection: (
     minifig: MinifigureMetadata,
     condition: MinifigCondition,
     quantity: number,
-    purchasePriceEur: number
+    purchasePriceEur: number,
+    estimatedUnitValueEur?: number,
+    targetCollectionId?: string | null
   ) => void;
-  onBulkAddToCollection: (lines: BulkImportParsedLine[]) => void;
+  onBulkAddToCollection: (
+    lines: BulkImportParsedLine[],
+    targetCollectionId?: string | null
+  ) => void;
 }
 
 interface BarcodeDetectorLike {
@@ -57,12 +71,18 @@ interface BarcodeDetectorLike {
 
 export const CameraScanner: React.FC<CameraScannerProps> = ({
   preferredPriceSource,
+  collections,
+  activeCollectionId,
+  onSelectCollection,
+  onCreateCollection,
   onSelectMinifigForComparison,
   onQuickAddToCollection,
   onBulkAddToCollection
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const galleryInputRef = useRef<HTMLInputElement | null>(null);
+  const nativeCameraInputRef = useRef<HTMLInputElement | null>(null);
 
   const [scannerMode, setScannerMode] = useState<ScannerMode>('single');
   const [cameraActive, setCameraActive] = useState(false);
@@ -70,12 +90,20 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   const [isScanning, setIsScanning] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
-  // Estado Modo Individual
-  const [selectedPresetId, setSelectedPresetId] = useState<string>('sw0002');
+  // Colección destino y creación rápida inline
+  const [targetCollectionId, setTargetCollectionId] = useState<string | null>(activeCollectionId);
+  const [creatingCollectionMode, setCreatingCollectionMode] = useState(false);
+  const [newCollectionName, setNewCollectionName] = useState('');
+
+  // Estado Modo Individual (arranca limpio, sin muestras de prueba precargadas)
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  const [showDemoStrip, setShowDemoStrip] = useState<boolean>(false);
   const [scanResult, setScanResult] = useState<RecognitionResult | null>(null);
   const [selectedCandidateIdx, setSelectedCandidateIdx] = useState<number>(0);
   const [showAllCandidates, setShowAllCandidates] = useState<boolean>(false);
   const [selectedCondition, setSelectedCondition] = useState<MinifigCondition>('used_complete');
+  const [customUnitValueInput, setCustomUnitValueInput] = useState<string>('');
+  const [manualCodeInput, setManualCodeInput] = useState<string>('');
 
   // Estado Modo Lote (Bulk)
   const [bulkSession, setBulkSession] = useState<BulkScanSession | null>(null);
@@ -83,27 +111,37 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   const [expandedAltSlot, setExpandedAltSlot] = useState<number | null>(null);
 
   // Estado Modo Cajas CMF
-  const [cmfInput, setCmfInput] = useState<string>(SAMPLE_CMF_PRESETS[0].code);
-  const [cmfResult, setCmfResult] = useState<CmfLookupResult>(() =>
-    lookupCmfCode(SAMPLE_CMF_PRESETS[0].code)
-  );
+  const [cmfInput, setCmfInput] = useState<string>('');
+  const [cmfResult, setCmfResult] = useState<CmfLookupResult | null>(null);
   const [cmfCondition, setCmfCondition] = useState<MinifigCondition>('new');
+  const [showCmfExamples, setShowCmfExamples] = useState<boolean>(false);
 
   const [addedFeedback, setAddedFeedback] = useState<string | null>(null);
 
-  const activePreset =
-    MINIFIG_CATALOG.find((m) => m.figId === selectedPresetId) ?? MINIFIG_CATALOG[0];
+  useEffect(() => {
+    setTargetCollectionId(activeCollectionId);
+  }, [activeCollectionId]);
+
+  // Vincula el MediaStream al <video> en cuanto el elemento se monte o active
+  useEffect(() => {
+    if (cameraActive && videoRef.current && mediaStreamRef.current) {
+      const videoEl = videoRef.current;
+      if (videoEl.srcObject !== mediaStreamRef.current) {
+        videoEl.srcObject = mediaStreamRef.current;
+        void videoEl.play().catch(() => undefined);
+      }
+    }
+  }, [cameraActive, scannerMode]);
 
   useEffect(() => {
-    void handleScanPreset('sw0002');
     return () => {
       stopCameraStream();
     };
   }, []);
 
-  // Lectura continua Data Matrix si el usuario activa cámara en modo CMF y el navegador soporta BarcodeDetector
+  // Lectura continua Data Matrix en modo CMF si el navegador soporta BarcodeDetector
   useEffect(() => {
-    if (scannerMode !== 'cmf' || !cameraActive || !videoRef.current) return;
+    if (scannerMode !== 'cmf' || !cameraActive) return;
     const win = window as unknown as {
       BarcodeDetector?: new (opts: { formats: string[] }) => BarcodeDetectorLike;
     };
@@ -112,7 +150,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     let cancelled = false;
     const detector = new win.BarcodeDetector({ formats: ['data_matrix', 'qr_code'] });
     const intervalId = window.setInterval(async () => {
-      if (cancelled || !videoRef.current) return;
+      if (cancelled || !videoRef.current || videoRef.current.readyState < 2) return;
       try {
         const codes = await detector.detect(videoRef.current);
         const firstRaw = codes.find((c) => c.rawValue)?.rawValue;
@@ -134,10 +172,14 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
 
   const showToast = (msg: string) => {
     setAddedFeedback(msg);
-    window.setTimeout(() => setAddedFeedback(null), 2600);
+    window.setTimeout(() => setAddedFeedback(null), 2800);
   };
 
   const stopCameraStream = () => {
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
     if (videoRef.current && videoRef.current.srcObject) {
       const stream = videoRef.current.srcObject as MediaStream;
       stream.getTracks().forEach((track) => track.stop());
@@ -147,11 +189,9 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   };
 
   const switchMode = (nextMode: ScannerMode) => {
+    stopCameraStream();
     setScannerMode(nextMode);
     setCameraError(null);
-    if (nextMode === 'bulk' && !bulkSession) {
-      void handleScanDemoBulkLot();
-    }
   };
 
   const toggleCamera = async () => {
@@ -160,6 +200,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       return;
     }
     setCameraError(null);
+
+    if (scannerMode === 'cmf') {
+      const win = window as unknown as { BarcodeDetector?: unknown };
+      if (!win.BarcodeDetector) {
+        setCameraError(
+          'Este navegador no soporta lectura automática de Data Matrix (iOS Safari lo restringe). Escribe o pega los 7 dígitos impresos bajo la caja.'
+        );
+        return;
+      }
+    }
+
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error('Navegador sin WebRTC');
@@ -172,16 +223,25 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         },
         audio: false
       });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-        setCameraActive(true);
+
+      const [track] = stream.getVideoTracks();
+      if (track && 'applyConstraints' in track) {
+        try {
+          await track.applyConstraints({
+            advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet]
+          });
+        } catch {
+          // Algunos dispositivos ignoran constraints avanzadas
+        }
       }
+
+      mediaStreamRef.current = stream;
+      setCameraActive(true);
     } catch {
       setCameraError(
         scannerMode === 'cmf'
-          ? 'Cámara no disponible. Introduce los 7 dígitos o prueba un código de ejemplo inferior.'
-          : 'Cámara no accesible en este navegador. Sube/arrastra una foto real al visor o usa las muestras.'
+          ? 'Cámara no accesible. Introduce manualmente los 7 dígitos impresos bajo la caja.'
+          : 'No se pudo abrir el vídeo en vivo. Usa el botón central para tomar la foto con la cámara nativa del móvil o elige una foto de tu galería.'
       );
       setCameraActive(false);
     }
@@ -192,6 +252,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     setSelectedPresetId(figId);
     setIsScanning(true);
     setShowAllCandidates(false);
+    setCameraError(null);
     const preset = MINIFIG_CATALOG.find((m) => m.figId === figId) ?? MINIFIG_CATALOG[0];
     try {
       const result = await identifyMinifigureFromImage({
@@ -209,6 +270,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     stopCameraStream();
     setIsScanning(true);
     setExpandedAltSlot(null);
+    setCameraError(null);
     try {
       const img = new Image();
       img.src = DEMO_BULK_LOT_IMAGE;
@@ -230,11 +292,13 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   };
 
   const handleShutterAction = async () => {
-    if (scannerMode === 'bulk') {
-      if (cameraActive && videoRef.current) {
-        setIsScanning(true);
-        try {
-          const { dataUrl } = await encodeFullFrameToWebP(videoRef.current, 960);
+    setCameraError(null);
+
+    if (cameraActive && videoRef.current) {
+      setIsScanning(true);
+      try {
+        if (scannerMode === 'bulk') {
+          const { dataUrl } = await encodeFullFrameToJpeg(videoRef.current, 1080);
           const session = await identifyBulkLotFromImage({
             sourceElement: videoRef.current,
             previewDataUrl: dataUrl,
@@ -242,81 +306,84 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           });
           setBulkSession(session);
           setFocusedBulkSlot(1);
+          setExpandedAltSlot(null);
           stopCameraStream();
-        } catch {
-          await handleScanDemoBulkLot();
-        } finally {
-          setIsScanning(false);
+        } else {
+          const { blob, dataUrl } = await preprocessImageSourceToBlob(videoRef.current, 840);
+          stopCameraStream();
+          const result = await identifyMinifigureFromImage({
+            blob,
+            previewDataUrl: dataUrl
+          });
+          setSelectedPresetId(null);
+          setScanResult(result);
+          setSelectedCandidateIdx(0);
+          setShowAllCandidates(false);
         }
-        return;
-      }
-      await handleScanDemoBulkLot();
-      return;
-    }
-
-    if (cameraActive && videoRef.current) {
-      setIsScanning(true);
-      try {
-        const { blob, dataUrl } = await preprocessImageSourceToBlob(videoRef.current, 720);
-        const result = await identifyMinifigureFromImage({
-          blob,
-          previewDataUrl: dataUrl
-        });
-        setScanResult(result);
-        setSelectedCandidateIdx(0);
-      } catch {
-        await handleScanPreset(selectedPresetId);
+      } catch (err) {
+        stopCameraStream();
+        setCameraError(
+          err instanceof Error
+            ? err.message
+            : 'No se pudo capturar el fotograma. Intenta hacer una foto directa.'
+        );
       } finally {
         setIsScanning(false);
       }
       return;
     }
-    await handleScanPreset(selectedPresetId);
+
+    // Sin vídeo WebRTC activo -> abrir directamente cámara nativa móvil (autofocus + alta resolución)
+    nativeCameraInputRef.current?.click();
   };
 
   const processImageFile = async (file: File) => {
     setIsScanning(true);
     setCameraError(null);
     stopCameraStream();
+    let imgUrl: string | null = null;
+
     try {
-      const imgUrl = URL.createObjectURL(file);
+      imgUrl = URL.createObjectURL(file);
       const img = new Image();
       img.src = imgUrl;
       await new Promise((resolve, reject) => {
         img.onload = resolve;
-        img.onerror = reject;
+        img.onerror = () => reject(new Error('Formato de imagen no compatible en este navegador.'));
       });
+      if (typeof img.decode === 'function') {
+        await img.decode().catch(() => undefined);
+      }
 
       if (scannerMode === 'bulk') {
-        const { dataUrl } = await encodeFullFrameToWebP(img, 960);
-        const isDemoName = file.name.toLowerCase().includes('bulk_lot');
+        const { dataUrl } = await encodeFullFrameToJpeg(img, 1080);
         const session = await identifyBulkLotFromImage({
           sourceElement: img,
           previewDataUrl: dataUrl,
-          isDemoLot: isDemoName
+          isDemoLot: false
         });
-        URL.revokeObjectURL(imgUrl);
         setBulkSession(session);
         setFocusedBulkSlot(1);
         setExpandedAltSlot(null);
       } else {
-        const { blob, dataUrl } = await preprocessImageSourceToBlob(img, 720);
-        URL.revokeObjectURL(imgUrl);
-
-        const matchedPreset = ALL_MINIFIG_CATALOG.find((m) =>
-          file.name.toLowerCase().includes(m.figId.toLowerCase())
-        );
-
+        const { blob, dataUrl } = await preprocessImageSourceToBlob(img, 840);
         const result = await identifyMinifigureFromImage({
           blob,
-          previewDataUrl: dataUrl,
-          presetFigId: matchedPreset?.figId
+          previewDataUrl: dataUrl
         });
+        setSelectedPresetId(null);
         setScanResult(result);
         setSelectedCandidateIdx(0);
         setShowAllCandidates(false);
       }
+    } catch (err) {
+      setCameraError(
+        err instanceof Error
+          ? err.message
+          : 'No se pudo leer la imagen seleccionada. Prueba otra foto (JPG/PNG).'
+      );
     } finally {
+      if (imgUrl) URL.revokeObjectURL(imgUrl);
       setIsScanning(false);
     }
   };
@@ -338,6 +405,30 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     }
   };
 
+  const handleManualCodeLookup = (e: React.FormEvent) => {
+    e.preventDefault();
+    const clean = manualCodeInput.trim();
+    if (!clean) return;
+    const meta = findMinifigById(clean) ?? createCustomMinifigMetadata({ figId: clean });
+    setScanResult({
+      scanId: `manual-${Date.now()}`,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: scanResult?.processedImageDataUrl || meta.imageUrl,
+      latencyMs: 1,
+      apiSource: 'hybrid_fallback',
+      candidates: [
+        {
+          minifig: meta,
+          confidence: 1,
+          matchedFeatures: meta.distinguishingFeatures.slice(0, 2),
+          source: 'local_vision_hybrid'
+        }
+      ]
+    });
+    setSelectedCandidateIdx(0);
+    setManualCodeInput('');
+  };
+
   const activeCandidate: RecognitionCandidate | undefined =
     scanResult?.candidates[selectedCandidateIdx] ?? scanResult?.candidates[0];
 
@@ -346,17 +437,83 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     return getQuickDualPricesEur(activeCandidate.minifig, preferredPriceSource);
   }, [activeCandidate, preferredPriceSource]);
 
-  const handleQuickAdd = (minifig: MinifigureMetadata, condition: MinifigCondition, qty = 1) => {
+  const currentConditionPriceEur = useMemo(() => {
+    if (!singleDualPrices) return 0;
+    return selectedCondition === 'new'
+      ? singleDualPrices.newEur
+      : selectedCondition === 'used_incomplete'
+      ? singleDualPrices.incompleteEur
+      : singleDualPrices.usedEur;
+  }, [singleDualPrices, selectedCondition]);
+
+  useEffect(() => {
+    if (activeCandidate && currentConditionPriceEur > 0) {
+      setCustomUnitValueInput(currentConditionPriceEur.toFixed(2));
+    } else {
+      setCustomUnitValueInput('');
+    }
+  }, [activeCandidate?.minifig.figId, currentConditionPriceEur]);
+
+  const resolvedSingleUnitValueEur = useMemo(() => {
+    const parsed = Number(customUnitValueInput.replace(',', '.'));
+    if (customUnitValueInput.trim() !== '' && Number.isFinite(parsed) && parsed > 0) {
+      return Math.round(parsed * 100) / 100;
+    }
+    return currentConditionPriceEur;
+  }, [customUnitValueInput, currentConditionPriceEur]);
+
+  const handleInlineCreateCollection = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = newCollectionName.trim();
+    if (!trimmed) return;
+    const created = await onCreateCollection(trimmed);
+    setTargetCollectionId(created.id);
+    setNewCollectionName('');
+    setCreatingCollectionMode(false);
+    showToast(`Colección «${created.name}» creada`);
+  };
+
+  const resolvedTargetCollectionName = useMemo(() => {
+    const found = collections.find((c) => c.id === targetCollectionId) ?? collections[0];
+    return found ? found.name : 'Mi Colección';
+  }, [collections, targetCollectionId]);
+
+  const handleQuickAdd = (
+    minifig: MinifigureMetadata,
+    condition: MinifigCondition,
+    qty = 1,
+    overrideUnitValueEur?: number
+  ) => {
     const dual = getQuickDualPricesEur(minifig, preferredPriceSource);
-    const unitVal =
+    const baseVal =
       condition === 'new'
         ? dual.newEur
         : condition === 'used_incomplete'
         ? dual.incompleteEur
         : dual.usedEur;
-    const defaultPaid = Math.round(unitVal * 0.78 * 100) / 100;
-    onQuickAddToCollection(minifig, condition, qty, defaultPaid);
-    showToast(`${qty}× ${minifig.figId.toUpperCase()} añadida a tu colección`);
+    const finalUnitVal = overrideUnitValueEur ?? baseVal;
+    const adjustedMinifig: MinifigureMetadata =
+      overrideUnitValueEur !== undefined && Math.abs(overrideUnitValueEur - baseVal) > 0.01
+        ? {
+            ...minifig,
+            baseMarketPriceEur: {
+              ...minifig.baseMarketPriceEur,
+              [condition]: finalUnitVal
+            },
+            isEstimatedFallbackPrice: false
+          }
+        : minifig;
+
+    const defaultPaid = Math.round(finalUnitVal * 0.78 * 100) / 100;
+    onQuickAddToCollection(
+      adjustedMinifig,
+      condition,
+      qty,
+      defaultPaid,
+      finalUnitVal,
+      targetCollectionId
+    );
+    showToast(`${qty}× ${minifig.figId.toUpperCase()} guardada en «${resolvedTargetCollectionName}»`);
   };
 
   // Manipuladores de filas del Modo Lote (Bulk)
@@ -434,13 +591,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       });
 
     if (lines.length === 0) return;
-    onBulkAddToCollection(lines);
-    showToast(`${bulkSummary.totalUnits} minifiguras añadidas al inventario`);
+    onBulkAddToCollection(lines, targetCollectionId);
+    showToast(`${bulkSummary.totalUnits} uds. guardadas en «${resolvedTargetCollectionName}»`);
   };
 
   const handleCmfSearch = (raw?: string) => {
     const query = raw ?? cmfInput;
     setCmfInput(query);
+    if (!query.trim()) {
+      setCmfResult(null);
+      return;
+    }
     setCmfResult(lookupCmfCode(query));
   };
 
@@ -450,6 +611,84 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       ? scanResult.candidates.slice(0, 12)
       : scanResult.candidates.slice(0, 3);
   }, [scanResult, showAllCandidates]);
+
+  const renderTargetCollectionSelector = (idSuffix: string) => (
+    <div className="target-collection-row">
+      <label htmlFor={`target-col-${idSuffix}`} className="eyebrow">
+        Guardar en
+      </label>
+      <div className="target-collection-controls">
+        {collections.length > 0 ? (
+          <select
+            id={`target-col-${idSuffix}`}
+            className="source-select-mini"
+            value={targetCollectionId ?? collections[0].id}
+            onChange={(e) => {
+              setTargetCollectionId(e.target.value);
+              onSelectCollection(e.target.value);
+            }}
+          >
+            {collections.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+                {c.isDemo ? ' (Prueba)' : ''}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <span className="section-hint">Se creará «Mi Colección»</span>
+        )}
+        <button
+          type="button"
+          className="btn-chip"
+          onClick={() => setCreatingCollectionMode((v) => !v)}
+          title="Crear colección nueva"
+        >
+          <FolderPlus size={12} />
+          <span>Nueva</span>
+        </button>
+      </div>
+
+      {creatingCollectionMode && (
+        <form className="inline-create-bar" onSubmit={(e) => void handleInlineCreateCollection(e)}>
+          <input
+            type="text"
+            className="field-input"
+            placeholder="Nombre de tu colección..."
+            value={newCollectionName}
+            onChange={(e) => setNewCollectionName(e.target.value)}
+            autoFocus
+          />
+          <button type="submit" className="btn-chip active">
+            Crear
+          </button>
+        </form>
+      )}
+    </div>
+  );
+
+  const singleHudLabel = useMemo(() => {
+    if (cameraActive) return 'Cámara en vivo · Apunta a la figura';
+    if (!scanResult) return 'Brickognize AI · Listo';
+    if (scanResult.apiSource === 'brickognize_live') return 'Brickognize API (En Vivo)';
+    if (scanResult.apiSource === 'demo_preset') return 'Ejemplo de Estudio';
+    if (scanResult.apiSource === 'hybrid_fallback') return 'Búsqueda Manual';
+    if (scanResult.apiSource === 'no_match') return 'Sin coincidencia';
+    return 'Error de conexión';
+  }, [cameraActive, scanResult]);
+
+  const bulkHudLabel = useMemo(() => {
+    if (cameraActive) return 'Cámara en vivo · Encuadra el lote';
+    if (!bulkSession) return 'Escáner de Lote · Listo';
+    if (bulkSession.apiSource === 'brickognize_live') {
+      return `Bulk · ${bulkSession.items.length} detectadas (En Vivo)`;
+    }
+    if (bulkSession.apiSource === 'demo_preset') {
+      return `Lote demo · ${bulkSession.items.length} figs`;
+    }
+    if (bulkSession.apiSource === 'no_match') return 'Sin figuras detectadas';
+    return 'Error en escaneo de lote';
+  }, [cameraActive, bulkSession]);
 
   return (
     <section className="screen-stack" aria-label="Escáner óptico de minifiguras LEGO">
@@ -509,7 +748,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             <div>
               <span className="eyebrow">Escáner de Cajas Sorpresa (Data Matrix)</span>
               <p className="section-hint" style={{ marginTop: 2 }}>
-                Introduce el código completo o los primeros 7 dígitos impresos en la base de la caja (series 25–27, Space, D&D, Spider-Verse).
+                Introduce los primeros 7 dígitos impresos en la base de la caja (Series 25–27, Space, D&D, Spider-Verse).
               </p>
             </div>
 
@@ -543,22 +782,37 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               </button>
             </form>
 
-            {cameraError && <p className="camera-notice" style={{ borderRadius: 8 }}>{cameraError}</p>}
+            {cameraError && (
+              <p className="camera-notice" style={{ borderRadius: 8 }}>
+                {cameraError}
+              </p>
+            )}
 
-            <div className="catalog-pills-scroll" style={{ marginTop: 2 }}>
-              {SAMPLE_CMF_PRESETS.map((preset) => (
-                <button
-                  key={preset.code}
-                  type="button"
-                  className={`catalog-pill ${cmfInput === preset.code ? 'active' : ''}`}
-                  onClick={() => handleCmfSearch(preset.code)}
-                >
-                  {preset.label}
-                </button>
-              ))}
+            <div>
+              <button
+                type="button"
+                className="link-btn-mini"
+                onClick={() => setShowCmfExamples((v) => !v)}
+              >
+                {showCmfExamples ? 'Ocultar códigos de ejemplo' : 'Probar con un código de ejemplo'}
+              </button>
+              {showCmfExamples && (
+                <div className="catalog-pills-scroll" style={{ marginTop: 6 }}>
+                  {SAMPLE_CMF_PRESETS.map((preset) => (
+                    <button
+                      key={preset.code}
+                      type="button"
+                      className={`catalog-pill ${cmfInput === preset.code ? 'active' : ''}`}
+                      onClick={() => handleCmfSearch(preset.code)}
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
-            {cmfResult.matched && cmfResult.entry && cmfResult.minifig ? (
+            {cmfResult && cmfResult.matched && cmfResult.entry && cmfResult.minifig && (
               <div className="cmf-result-banner" id="cmf-result-panel">
                 <div className="hero-fig-row" style={{ paddingBottom: 8 }}>
                   <img
@@ -581,15 +835,19 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                   </div>
                 </div>
 
-                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                <div
+                  style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 8
+                  }}
+                >
                   <span className="cmf-factory-tag">{cmfResult.factoryLabel}</span>
                   <div className="brickem-dual-prices">
-                    <span className="used">
-                      Nueva {cmfResult.entry.estNewEur.toFixed(2)} €
-                    </span>
-                    <span className="new">
-                      Usada {cmfResult.entry.estUsedEur.toFixed(2)} €
-                    </span>
+                    <span className="used">Nueva {cmfResult.entry.estNewEur.toFixed(2)} €</span>
+                    <span className="new">Usada {cmfResult.entry.estUsedEur.toFixed(2)} €</span>
                   </div>
                 </div>
 
@@ -597,7 +855,18 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                   <p className="section-hint">{cmfResult.entry.rarityNote}</p>
                 )}
 
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginTop: 2 }}>
+                {renderTargetCollectionSelector('cmf')}
+
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: 8,
+                    marginTop: 2
+                  }}
+                >
                   <div className="brickem-cond-mini" role="group" aria-label="Estado CMF">
                     <button
                       type="button"
@@ -631,7 +900,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                       className="btn-chip active"
                       onClick={() => handleQuickAdd(cmfResult.minifig!, cmfCondition, 1)}
                     >
-                      +1 Inventario
+                      +1 Colección
                     </button>
                   </div>
                 </div>
@@ -643,12 +912,16 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                   </div>
                 )}
               </div>
-            ) : (
+            )}
+
+            {cmfResult && !cmfResult.matched && (
               <div className="cmf-result-banner" id="cmf-result-empty">
-                <strong style={{ fontSize: '0.82rem' }}>Código no encontrado en series locales</strong>
+                <strong style={{ fontSize: '0.82rem' }}>
+                  Código no encontrado en series CMF locales
+                </strong>
                 <span className="section-hint">
                   Código detectado: <span className="mono">{cmfResult.scannedElementId || '—'}</span> ·{' '}
-                  {cmfResult.factoryLabel}. Prueba con las series 71045–71050 o selecciona un ejemplo arriba.
+                  {cmfResult.factoryLabel}. Compatible con Series 25, 26 Space, D&D, Serie 27 y Spider-Verse.
                 </span>
               </div>
             )}
@@ -674,66 +947,81 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             >
               {cameraActive ? (
                 <video ref={videoRef} className="viewfinder-media" playsInline muted autoPlay />
-              ) : scannerMode === 'bulk' ? (
+              ) : scannerMode === 'bulk' && bulkSession ? (
                 <img
-                  src={bulkSession?.sourceImageDataUrl || DEMO_BULK_LOT_IMAGE}
+                  src={bulkSession.sourceImageDataUrl}
                   alt="Lote múltiple de minifiguras LEGO"
                   className={`viewfinder-media ${isScanning ? 'scanning' : ''}`}
-                  style={{ objectFit: 'fill' }}
+                  style={{ objectFit: 'contain' }}
+                />
+              ) : scannerMode === 'single' && scanResult?.processedImageDataUrl ? (
+                <img
+                  src={scanResult.processedImageDataUrl}
+                  alt={activeCandidate?.minifig.name || 'Captura de minifigura'}
+                  className={`viewfinder-media ${isScanning ? 'scanning' : ''}`}
+                  style={{ objectFit: 'contain' }}
                 />
               ) : (
-                <img
-                  src={scanResult?.processedImageDataUrl || activePreset.imageUrl}
-                  alt={activeCandidate?.minifig.name || activePreset.name}
-                  className={`viewfinder-media ${isScanning ? 'scanning' : ''}`}
-                />
+                <div className="scanner-empty-stage">
+                  <div className="scanner-empty-icon">
+                    {scannerMode === 'bulk' ? <Grid size={26} /> : <Camera size={26} />}
+                  </div>
+                  <strong>
+                    {scannerMode === 'bulk'
+                      ? 'Escanea un lote sobre fondo liso'
+                      : 'Fotografía o sube 1 minifigura'}
+                  </strong>
+                  <span>
+                    {scannerMode === 'bulk'
+                      ? 'Separa ligeramente las figuras sobre una mesa clara y pulsa el disparador.'
+                      : 'Encuadra de pies a cabeza con buena luz. Identificación real vía Brickognize.'}
+                  </span>
+                </div>
               )}
 
               {/* HUD Minimalista */}
               <div className="hud-top">
                 <span className="hud-pill">
-                  {scannerMode === 'bulk'
-                    ? bulkSession?.apiSource === 'brickognize_live'
-                      ? 'Bulk · Brickognize API'
-                      : `Lote ${bulkSession?.items.length ?? 0} figs · Listo`
-                    : scanResult?.apiSource === 'brickognize_live'
-                    ? 'Brickognize API (En Vivo)'
-                    : 'Catálogo Estudio · Listo'}
+                  {scannerMode === 'bulk' ? bulkHudLabel : singleHudLabel}
                 </span>
-                {(scannerMode === 'bulk' ? bulkSession?.latencyMs : scanResult?.latencyMs) && (
+                {(scannerMode === 'bulk' ? bulkSession?.latencyMs : scanResult?.latencyMs) ? (
                   <span className="hud-pill latency" id="scanner-latency-badge">
                     <Zap size={11} />{' '}
                     {scannerMode === 'bulk' ? bulkSession?.latencyMs : scanResult?.latencyMs} ms
                   </span>
-                )}
+                ) : null}
               </div>
 
               {/* Recuadros numerados en Modo Bulk */}
-              {scannerMode === 'bulk' && !cameraActive && bulkSession && !isScanning && (
-                <div className="bulk-overlay-layer" aria-label="Figuras detectadas en la imagen">
-                  {bulkSession.items.map((item) => {
-                    const isFocused = focusedBulkSlot === item.slotIndex;
-                    return (
-                      <button
-                        key={item.slotIndex}
-                        type="button"
-                        id={`bulk-bbox-${item.slotIndex}`}
-                        className={`bulk-bbox-overlay ${isFocused ? 'active' : ''}`}
-                        style={{
-                          left: `${item.boundingBox.x * 100}%`,
-                          top: `${item.boundingBox.y * 100}%`,
-                          width: `${item.boundingBox.width * 100}%`,
-                          height: `${item.boundingBox.height * 100}%`
-                        }}
-                        onClick={() => setFocusedBulkSlot(item.slotIndex)}
-                        title={`#${item.slotIndex} ${item.selectedMinifig.figId}`}
-                      >
-                        <span className="bulk-bbox-tag">{item.slotIndex}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
+              {scannerMode === 'bulk' &&
+                !cameraActive &&
+                bulkSession &&
+                bulkSession.items.length > 0 &&
+                !isScanning && (
+                  <div className="bulk-overlay-layer" aria-label="Figuras detectadas en la imagen">
+                    {bulkSession.items.map((item) => {
+                      const isFocused = focusedBulkSlot === item.slotIndex;
+                      return (
+                        <button
+                          key={item.slotIndex}
+                          type="button"
+                          id={`bulk-bbox-${item.slotIndex}`}
+                          className={`bulk-bbox-overlay ${isFocused ? 'active' : ''}`}
+                          style={{
+                            left: `${item.boundingBox.x * 100}%`,
+                            top: `${item.boundingBox.y * 100}%`,
+                            width: `${item.boundingBox.width * 100}%`,
+                            height: `${item.boundingBox.height * 100}%`
+                          }}
+                          onClick={() => setFocusedBulkSlot(item.slotIndex)}
+                          title={`#${item.slotIndex} ${item.selectedMinifig.figId}`}
+                        >
+                          <span className="bulk-bbox-tag">{item.slotIndex}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
 
               {scannerMode === 'single' && (
                 <div className={`reticle-frame ${isScanning ? 'scanning' : ''}`} aria-hidden="true">
@@ -755,16 +1043,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
 
             {cameraError && <p className="camera-notice">{cameraError}</p>}
 
-            {/* Barra Táctil de Cámara */}
+            {/* Barra Táctil de Cámara (Galería · Foto Nativa/Captura · Vídeo en vivo) */}
             <div className="camera-control-deck">
               <button
                 type="button"
                 id="btn-upload-photo"
                 className="deck-side-btn"
-                onClick={() => fileInputRef.current?.click()}
+                disabled={isScanning}
+                onClick={() => galleryInputRef.current?.click()}
               >
                 <ImagePlus size={16} />
-                <span>{scannerMode === 'bulk' ? 'Subir Lote' : 'Subir Foto'}</span>
+                <span>Galería</span>
               </button>
 
               <button
@@ -773,11 +1062,21 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                 className="shutter-trigger"
                 onClick={() => void handleShutterAction()}
                 disabled={isScanning}
-                aria-label={scannerMode === 'bulk' ? 'Escanear lote múltiple' : 'Escanear minifigura'}
-                title={scannerMode === 'bulk' ? 'Detectar todas las figuras' : 'Escanear / Capturar'}
+                aria-label={
+                  cameraActive
+                    ? 'Capturar y analizar'
+                    : scannerMode === 'bulk'
+                    ? 'Hacer foto de lote con cámara'
+                    : 'Hacer foto de minifigura con cámara'
+                }
+                title={
+                  cameraActive
+                    ? 'Capturar fotograma'
+                    : 'Abrir cámara del móvil y escanear'
+                }
               >
                 <span className="shutter-core">
-                  <Sparkles size={20} />
+                  {cameraActive ? <Sparkles size={20} /> : <Camera size={20} />}
                 </span>
               </button>
 
@@ -785,14 +1084,27 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                 type="button"
                 id="btn-toggle-camera"
                 className={`deck-side-btn ${cameraActive ? 'active' : ''}`}
+                disabled={isScanning}
                 onClick={() => void toggleCamera()}
               >
-                <Camera size={16} />
-                <span>{cameraActive ? 'Cerrar Cam' : 'Cámara'}</span>
+                <Zap size={16} />
+                <span>{cameraActive ? 'Cerrar' : 'En vivo'}</span>
               </button>
 
+              {/* Input de Galería (sin capture, abre carrete / archivos en iOS y Android) */}
               <input
-                ref={fileInputRef}
+                ref={galleryInputRef}
+                id="gallery-file-input"
+                type="file"
+                accept="image/*"
+                className="sr-only"
+                onChange={handleFileUpload}
+              />
+
+              {/* Input de Cámara Nativa (con capture="environment", mejor enfoque macro en móviles) */}
+              <input
+                ref={nativeCameraInputRef}
+                id="native-camera-file-input"
                 type="file"
                 accept="image/*"
                 capture="environment"
@@ -801,52 +1113,162 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               />
             </div>
 
-            {/* Tira de Muestras (Individual) o Acceso Rápido Lote (Bulk) */}
-            {scannerMode === 'single' ? (
-              <div className="filmstrip-bar">
-                <div className="filmstrip-label">
-                  <span>Muestras rápidas de prueba (o arrastra tu foto al visor)</span>
-                  <span className="mono">{MINIFIG_CATALOG.length} refs</span>
-                </div>
-                <div className="filmstrip-scroll" role="list">
-                  {MINIFIG_CATALOG.map((item) => {
-                    const isSelected = item.figId === selectedPresetId;
-                    return (
-                      <button
-                        key={item.figId}
-                        type="button"
-                        id={`sample-preset-${item.figId}`}
-                        className={`filmstrip-thumb ${isSelected ? 'active' : ''}`}
-                        onClick={() => void handleScanPreset(item.figId)}
-                      >
-                        <img src={item.imageUrl} alt={item.name} />
-                        <span>{item.figId.toUpperCase()}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : (
-              <div className="filmstrip-bar">
-                <div className="filmstrip-label" style={{ marginBottom: 0 }}>
-                  <span>Sube 1 foto de mesa/lote con varias minifiguras</span>
+            {/* Opción discreta de ejemplos (oculta por defecto para cero ruido de prueba) */}
+            <div className="filmstrip-bar">
+              {scannerMode === 'single' ? (
+                <>
+                  <div className="demo-optin-row">
+                    <span className="section-hint">
+                      Usa el botón central para foto directa con autofocus.
+                    </span>
+                    <button
+                      type="button"
+                      id="btn-toggle-demo-strip"
+                      className="link-btn-mini"
+                      onClick={() => setShowDemoStrip((v) => !v)}
+                    >
+                      {showDemoStrip ? 'Ocultar ejemplos' : 'Probar ejemplo'}
+                    </button>
+                  </div>
+                  {showDemoStrip && (
+                    <div className="filmstrip-scroll" role="list" style={{ marginTop: 8 }}>
+                      {MINIFIG_CATALOG.map((item) => {
+                        const isSelected = item.figId === selectedPresetId;
+                        return (
+                          <button
+                            key={item.figId}
+                            type="button"
+                            id={`sample-preset-${item.figId}`}
+                            className={`filmstrip-thumb ${isSelected ? 'active' : ''}`}
+                            onClick={() => void handleScanPreset(item.figId)}
+                          >
+                            <img src={item.imageUrl} alt={item.name} />
+                            <span>{item.figId.toUpperCase()}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="demo-optin-row">
+                  <span className="section-hint">
+                    Foto de mesa/lote sobre superficie clara para detectar varias figuras.
+                  </span>
                   <button
                     type="button"
                     id="btn-demo-bulk-lot"
                     className="link-btn-mini"
                     onClick={() => void handleScanDemoBulkLot()}
                   >
-                    Recargar lote demo (6 figs)
+                    Probar lote demo
                   </button>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </>
         )}
       </div>
 
+      {/* TARJETA DE DIAGNÓSTICO HONESTA (Individual: sin coincidencia o error de red) */}
+      {scannerMode === 'single' &&
+        scanResult &&
+        (scanResult.apiSource === 'no_match' || scanResult.apiSource === 'error') &&
+        !isScanning && (
+          <div className="surface-card scanner-diagnostic-card" id="scanner-diagnostic-panel">
+            <div className="diagnostic-header">
+              <AlertTriangle size={18} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+              <div>
+                <h2 className="fig-title-lg" style={{ fontSize: '0.96rem', marginTop: 0 }}>
+                  {scanResult.apiSource === 'no_match'
+                    ? 'No se encontró coincidencia fiable'
+                    : 'No se pudo completar el escaneo'}
+                </h2>
+                <p className="section-hint" style={{ marginTop: 3 }}>
+                  {scanResult.errorMessage}
+                </p>
+              </div>
+            </div>
+
+            <div className="diagnostic-actions">
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => nativeCameraInputRef.current?.click()}
+              >
+                <RotateCcw size={14} />
+                <span>Reintentar foto</span>
+              </button>
+              <button
+                type="button"
+                className="btn-tonal"
+                onClick={() => galleryInputRef.current?.click()}
+              >
+                <ImagePlus size={14} />
+                <span>Elegir de galería</span>
+              </button>
+            </div>
+
+            <form className="manual-fallback-row" onSubmit={handleManualCodeLookup}>
+              <input
+                type="text"
+                id="scanner-manual-code-input"
+                className="field-input mono"
+                placeholder="¿Sabes el código? Ej: sw0585, col448..."
+                value={manualCodeInput}
+                onChange={(e) => setManualCodeInput(e.target.value)}
+              />
+              <button type="submit" className="btn-chip active">
+                <Search size={13} />
+                <span>Buscar código</span>
+              </button>
+            </form>
+          </div>
+        )}
+
+      {/* DIAGNÓSTICO MODO LOTE (Bulk vacío o con error) */}
+      {scannerMode === 'bulk' &&
+        bulkSession &&
+        bulkSession.items.length === 0 &&
+        !isScanning && (
+          <div className="surface-card scanner-diagnostic-card" id="bulk-diagnostic-panel">
+            <div className="diagnostic-header">
+              <AlertTriangle size={18} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+              <div>
+                <h2 className="fig-title-lg" style={{ fontSize: '0.96rem', marginTop: 0 }}>
+                  {bulkSession.apiSource === 'error'
+                    ? 'Error al analizar el lote'
+                    : 'No se identificaron minifiguras en la imagen'}
+                </h2>
+                <p className="section-hint" style={{ marginTop: 3 }}>
+                  {bulkSession.errorMessage ||
+                    'Coloca las minifiguras separadas entre sí sobre una mesa o papel claro y vuelve a intentarlo.'}
+                </p>
+              </div>
+            </div>
+            <div className="diagnostic-actions">
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => nativeCameraInputRef.current?.click()}
+              >
+                <RotateCcw size={14} />
+                <span>Hacer nueva foto</span>
+              </button>
+              <button
+                type="button"
+                className="btn-tonal"
+                onClick={() => galleryInputRef.current?.click()}
+              >
+                <ImagePlus size={14} />
+                <span>Subir de galería</span>
+              </button>
+            </div>
+          </div>
+        )}
+
       {/* PANEL DE RESULTADO: MODO LOTE (Estilo brick'em) */}
-      {scannerMode === 'bulk' && bulkSession && (
+      {scannerMode === 'bulk' && bulkSession && bulkSession.items.length > 0 && (
         <div className="surface-card" id="bulk-result-panel">
           <div className="bulk-summary-bar">
             <div>
@@ -906,7 +1328,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                     <div className="brickem-info">
                       <div className="brickem-title">{item.selectedMinifig.name}</div>
                       <div className="brickem-subline">
-                        <span className="code-chip" style={{ fontSize: '0.64rem', padding: '1px 5px' }}>
+                        <span
+                          className="code-chip"
+                          style={{ fontSize: '0.64rem', padding: '1px 5px' }}
+                        >
                           {item.selectedMinifig.figId.toUpperCase()}
                         </span>
                         <div className="brickem-dual-prices">
@@ -985,7 +1410,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                         onClick={() =>
                           setExpandedAltSlot(isAltOpen ? null : item.slotIndex)
                         }
-                        title="Cambiar entre 12 alternativas"
+                        title="Cambiar entre alternativas"
                       >
                         <MoreVertical size={12} />
                         <span>{item.candidates.length} alt.</span>
@@ -1011,8 +1436,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                       </span>
                       <div className="brickem-alt-grid">
                         {item.candidates.map((cand) => {
-                          const selected =
-                            cand.minifig.figId === item.selectedMinifig.figId;
+                          const selected = cand.minifig.figId === item.selectedMinifig.figId;
                           return (
                             <button
                               key={cand.minifig.figId}
@@ -1042,6 +1466,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             })}
           </div>
 
+          <div style={{ marginTop: 12 }}>{renderTargetCollectionSelector('bulk')}</div>
+
           {addedFeedback && (
             <div className="feedback-banner" role="status">
               <CheckCircle2 size={16} />
@@ -1059,7 +1485,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           >
             <CheckCircle2 size={16} />
             <span>
-              Añadir todas ({bulkSummary.totalUnits} uds. · {bulkSummary.totalValueEur.toFixed(2)} €) al inventario
+              Guardar todas ({bulkSummary.totalUnits} uds. · {bulkSummary.totalValueEur.toFixed(2)}{' '}
+              €)
             </span>
           </button>
         </div>
@@ -1070,13 +1497,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         <div className="surface-card" id="recognition-result-panel">
           <div className="sheet-header">
             <div>
-              <span className="eyebrow">Minifigura Identificada</span>
+              <span className="eyebrow">
+                {scanResult?.apiSource === 'brickognize_live'
+                  ? 'Identificada por Brickognize'
+                  : 'Minifigura Identificada'}
+              </span>
               <h2 className="fig-title-lg">{activeCandidate.minifig.name}</h2>
               <div className="fig-meta-line">
                 <span className="code-chip">{activeCandidate.minifig.figId.toUpperCase()}</span>
                 <span>{activeCandidate.minifig.theme}</span>
                 <span>· {activeCandidate.minifig.yearReleased}</span>
-                <span>· Set {activeCandidate.minifig.sampleSetCode}</span>
+                <span>· {activeCandidate.minifig.sampleSetCode}</span>
               </div>
             </div>
             <span className={`rarity-tag ${activeCandidate.minifig.rarity}`}>
@@ -1127,6 +1558,31 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             </div>
           </div>
 
+          {/* Ajuste de precio cuando la figura no tiene precio local guardado */}
+          <div className="sheet-section">
+            <div className="price-override-row">
+              <div>
+                <label htmlFor="scanner-unit-value-input" className="eyebrow">
+                  Valor estimado (€)
+                </label>
+                {activeCandidate.minifig.isEstimatedFallbackPrice && (
+                  <p className="section-hint" style={{ fontSize: '0.7rem' }}>
+                    Precio base orientativo. Consulta los 5 portales o ajústalo antes de guardar.
+                  </p>
+                )}
+              </div>
+              <input
+                id="scanner-unit-value-input"
+                type="number"
+                step="0.01"
+                min={0.5}
+                className="field-input mono price-override-input"
+                value={customUnitValueInput}
+                onChange={(e) => setCustomUnitValueInput(e.target.value)}
+              />
+            </div>
+          </div>
+
           {/* Desambiguación hasta Top-12 */}
           {scanResult && scanResult.candidates.length > 1 && (
             <div className="sheet-section">
@@ -1171,7 +1627,9 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           <div className="sheet-section">
             <details className="optical-disclosure">
               <summary>
-                <span>Rasgos ópticos verificados ({activeCandidate.minifig.distinguishingFeatures.length})</span>
+                <span>
+                  Detalles de la referencia ({activeCandidate.minifig.distinguishingFeatures.length})
+                </span>
                 <ChevronDown size={15} />
               </summary>
               <ul>
@@ -1181,6 +1639,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               </ul>
             </details>
           </div>
+
+          <div className="sheet-section">{renderTargetCollectionSelector('single')}</div>
 
           {addedFeedback && (
             <div className="feedback-banner" role="status">
@@ -1194,9 +1654,20 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               type="button"
               id="btn-compare-prices-from-scan"
               className="btn-primary"
-              onClick={() =>
-                onSelectMinifigForComparison(activeCandidate.minifig, selectedCondition)
-              }
+              onClick={() => {
+                const updatedFig: MinifigureMetadata =
+                  Math.abs(resolvedSingleUnitValueEur - currentConditionPriceEur) > 0.01
+                    ? {
+                        ...activeCandidate.minifig,
+                        baseMarketPriceEur: {
+                          ...activeCandidate.minifig.baseMarketPriceEur,
+                          [selectedCondition]: resolvedSingleUnitValueEur
+                        },
+                        isEstimatedFallbackPrice: false
+                      }
+                    : activeCandidate.minifig;
+                onSelectMinifigForComparison(updatedFig, selectedCondition);
+              }}
             >
               <Search size={16} />
               <span>Comparar 5 Portales</span>
@@ -1207,7 +1678,14 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               type="button"
               id="btn-quick-add-collection"
               className="btn-tonal"
-              onClick={() => handleQuickAdd(activeCandidate.minifig, selectedCondition, 1)}
+              onClick={() =>
+                handleQuickAdd(
+                  activeCandidate.minifig,
+                  selectedCondition,
+                  1,
+                  resolvedSingleUnitValueEur
+                )
+              }
             >
               <CheckCircle2 size={16} />
               <span>+1 a Colección</span>

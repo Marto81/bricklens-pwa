@@ -549,6 +549,93 @@ export const DEMO_BULK_LOT_SLOTS: DemoBulkSlot[] = [
   { slotIndex: 6, figId: 'sp0002', boundingBox: { x: 0.6708, y: 0.5188, width: 0.2917, height: 0.4313 } }
 ];
 
+export function guessThemeFromFigId(figId: string): string {
+  const clean = figId.trim().toLowerCase();
+  if (clean.startsWith('sw')) return 'Star Wars';
+  if (clean.startsWith('sh')) return 'Marvel / DC Super Heroes';
+  if (clean.startsWith('hp')) return 'Harry Potter';
+  if (clean.startsWith('njo')) return 'Ninjago';
+  if (clean.startsWith('cas')) return 'Castle';
+  if (clean.startsWith('sp')) return 'Classic Space';
+  if (clean.startsWith('cty')) return 'City';
+  if (clean.startsWith('col') || clean.startsWith('dnd')) return 'Collectible Minifigures';
+  if (clean.startsWith('lotr') || clean.startsWith('lor')) return 'Lord of the Rings';
+  if (clean.startsWith('pir')) return 'Pirates';
+  return 'LEGO System';
+}
+
+export function createCustomMinifigMetadata(params: {
+  figId: string;
+  name?: string;
+  theme?: string;
+  imageUrl?: string;
+  usedEur?: number;
+  newEur?: number;
+  incompleteEur?: number;
+  notes?: string;
+}): MinifigureMetadata {
+  const existing = findMinifigById(params.figId);
+  if (existing) return existing;
+
+  const cleanId = params.figId.trim().toLowerCase() || 'custom';
+  const estUsed = Math.max(
+    0.5,
+    Math.round((params.usedEur ?? 9.5) * 100) / 100
+  );
+  const estNew = Math.max(
+    estUsed,
+    Math.round((params.newEur ?? estUsed * 1.42) * 100) / 100
+  );
+  const estIncomplete = Math.max(
+    0.5,
+    Math.round((params.incompleteEur ?? estUsed * 0.56) * 100) / 100
+  );
+  const resolvedTheme = params.theme?.trim() || guessThemeFromFigId(cleanId);
+
+  return {
+    figId: cleanId,
+    rebrickableId: `fig-${cleanId}`,
+    name: params.name?.trim() || `Minifigura LEGO ${cleanId.toUpperCase()}`,
+    theme: resolvedTheme,
+    yearReleased: 2020,
+    numParts: 4,
+    rarity: estUsed >= 35 ? 'rare' : estUsed >= 12 ? 'uncommon' : 'common',
+    imageUrl: params.imageUrl || makeMinimalFigAvatar(cleanId, '#1b1f29', '#475569', '#fbbf24'),
+    appearsInSets: 1,
+    sampleSetCode: 'Catálogo BrickLink',
+    distinguishingFeatures: [
+      params.notes || `Referencia BrickLink ${cleanId.toUpperCase()}`,
+      'Cotización orientativa modificable según mercado real'
+    ],
+    parts: [
+      {
+        partNum: `${cleanId}-h`,
+        name: 'Cabeza / Casco',
+        category: 'headgear',
+        avgPriceEur: Math.round(estUsed * 0.34 * 100) / 100
+      },
+      {
+        partNum: `${cleanId}-t`,
+        name: 'Torso Impreso',
+        category: 'torso',
+        avgPriceEur: Math.round(estUsed * 0.41 * 100) / 100
+      },
+      {
+        partNum: `${cleanId}-l`,
+        name: 'Piernas',
+        category: 'legs',
+        avgPriceEur: Math.round(estUsed * 0.25 * 100) / 100
+      }
+    ],
+    baseMarketPriceEur: {
+      new: estNew,
+      used_complete: estUsed,
+      used_incomplete: estIncomplete
+    },
+    isEstimatedFallbackPrice: params.usedEur === undefined
+  };
+}
+
 export function findMinifigById(figId: string): MinifigureMetadata | undefined {
   const normalized = figId.trim().toLowerCase();
   return ALL_MINIFIG_CATALOG.find(
@@ -567,3 +654,4 @@ export function searchMinifigCatalog(query: string): MinifigureMetadata[] {
       m.sampleSetCode.toLowerCase().includes(q)
   );
 }
+

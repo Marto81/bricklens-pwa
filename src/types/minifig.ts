@@ -39,7 +39,15 @@ export interface MinifigureMetadata {
     used_complete: number;
     used_incomplete: number;
   };
+  isEstimatedFallbackPrice?: boolean;
 }
+
+export type RecognitionApiSource =
+  | 'brickognize_live'
+  | 'demo_preset'
+  | 'no_match'
+  | 'error'
+  | 'hybrid_fallback';
 
 export interface RecognitionCandidate {
   minifig: MinifigureMetadata;
@@ -54,7 +62,9 @@ export interface RecognitionResult {
   capturedAtIso: string;
   processedImageDataUrl: string;
   latencyMs: number;
-  apiSource: 'brickognize_live' | 'hybrid_fallback';
+  apiSource: RecognitionApiSource;
+  errorMessage?: string;
+  detectedBoxScore?: number;
   candidates: RecognitionCandidate[];
 }
 
@@ -75,7 +85,8 @@ export interface BulkScanSession {
   sourceImageDataUrl: string;
   aspectRatio?: number;
   latencyMs: number;
-  apiSource: 'brickognize_live' | 'hybrid_fallback';
+  apiSource: RecognitionApiSource;
+  errorMessage?: string;
   items: BulkScanDetectedItem[];
 }
 
@@ -133,8 +144,17 @@ export interface PriceComparisonReport {
   calculatedAtIso: string;
 }
 
+export interface UserCollection {
+  id: string;
+  name: string;
+  isDemo?: boolean;
+  createdAtIso: string;
+  updatedAtIso: string;
+}
+
 export interface CollectionItem {
   id: string;
+  collectionId: string;
   minifig: MinifigureMetadata;
   condition: MinifigCondition;
   quantity: number;

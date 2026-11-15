@@ -26,18 +26,21 @@ if (!isset($_FILES['query_image']) || $_FILES['query_image']['error'] !== UPLOAD
 
 $requestedMode = $_GET['mode'] ?? 'figs';
 $mode = in_array($requestedMode, ['figs', 'parts'], true) ? $requestedMode : 'figs';
-$tmpPath = $_FILES['query_image']['tmp_name'];
-$mimeType = $_FILES['query_image']['type'] ?: 'image/webp';
-$fileName = $_FILES['query_image']['name'] ?: 'minifig_scan.webp';
+$topK = isset($_GET['top_k_items']) ? max(1, min(50, (int) $_GET['top_k_items'])) : 12;
+$minSim = isset($_GET['min_similarity_items']) ? max(0.05, min(1.0, (float) $_GET['min_similarity_items'])) : 0.2;
 
-$ch = curl_init("https://api.brickognize.com/predict/{$mode}/");
+$tmpPath = $_FILES['query_image']['tmp_name'];
+$mimeType = $_FILES['query_image']['type'] ?: 'image/jpeg';
+$fileName = $_FILES['query_image']['name'] ?: 'minifig_scan.jpg';
+
+$ch = curl_init("https://api.brickognize.com/predict/{$mode}/?top_k_items={$topK}&min_similarity_items={$minSim}");
 $cfile = new CURLFile($tmpPath, $mimeType, $fileName);
 
 curl_setopt_array($ch, [
     CURLOPT_POST => true,
     CURLOPT_POSTFIELDS => ['query_image' => $cfile],
     CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => 12,
+    CURLOPT_TIMEOUT => 15,
     CURLOPT_HTTPHEADER => ['Accept: application/json'],
 ]);
 
