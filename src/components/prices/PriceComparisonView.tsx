@@ -2,18 +2,18 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Check,
   ChevronDown,
-  ExternalLink,
   FolderPlus,
-  Info,
+  Loader2,
   Plus,
   PlusCircle,
-  Search,
-  TrendingUp
+  Puzzle,
+  Search
 } from 'lucide-react';
 import type {
   MinifigCondition,
   MinifigureMetadata,
   PreferredPriceSource,
+  PriceComparisonReport,
   UserCollection
 } from '../../types/minifig';
 import {
@@ -22,11 +22,13 @@ import {
   findMinifigById,
   searchMinifigCatalog
 } from '../../data/catalogPresets';
+import { searchMinifigsHybrid } from '../../services/catalogService';
 import {
   generatePriceComparisonReport,
   getQuickDualPricesEur,
   PREFERRED_PRICE_SOURCE_LABELS
 } from '../../services/priceAggregator';
+import { PriceAverageCard } from '../shared/PriceAverageCard';
 
 interface PriceComparisonViewProps {
   selectedMinifig: MinifigureMetadata;
@@ -39,6 +41,7 @@ interface PriceComparisonViewProps {
   onChangePreferredSource: (source: PreferredPriceSource) => void;
   onChangeMinifig: (minifig: MinifigureMetadata) => void;
   onChangeCondition: (condition: MinifigCondition) => void;
+  onOpenMinifigDetail: (minifig: MinifigureMetadata, condition: MinifigCondition) => void;
   onAddToCollection: (params: {
     collectionId?: string | null;
     minifig: MinifigureMetadata;
@@ -61,9 +64,13 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
   onChangePreferredSource,
   onChangeMinifig,
   onChangeCondition,
+  onOpenMinifigDetail,
   onAddToCollection
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
+  const [hybridResults, setHybridResults] = useState<MinifigureMetadata[]>(ALL_MINIFIG_CATALOG);
+  const [searchingLive, setSearchingLive] = useState(false);
+
   const [quantityToAdd, setQuantityToAdd] = useState<number>(1);
   const [purchasePriceInput, setPurchasePriceInput] = useState<string>('');
   const [marketPriceInput, setMarketPriceInput] = useState<string>('');
@@ -74,11 +81,39 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
   const [creatingCollectionMode, setCreatingCollectionMode] = useState(false);
   const [newCollectionName, setNewCollectionName] = useState('');
 
+  const [activeReport, setActiveReport] = useState<PriceComparisonReport>(() =>
+    generatePriceComparisonReport(selectedMinifig, selectedCondition, preferredPriceSource)
+  );
+
   useEffect(() => {
     setTargetCollectionId(activeCollectionId);
   }, [activeCollectionId]);
 
-  const searchResults = useMemo(() => searchMinifigCatalog(searchQuery), [searchQuery]);
+  useEffect(() => {
+    const local = searchMinifigCatalog(searchQuery);
+    setHybridResults(local);
+
+    if (searchQuery.trim().length < 2) {
+      setSearchingLive(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setSearchingLive(true);
+      try {
+        const res = await searchMinifigsHybrid(searchQuery);
+        if (!cancelled) setHybridResults(res.results);
+      } finally {
+        if (!cancelled) setSearchingLive(false);
+      }
+    }, 320);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [searchQuery]);
 
   const cleanTypedCode = useMemo(
     () => searchQuery.trim().replace(/\s+/g, '').toLowerCase(),
@@ -91,47 +126,19 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
   }, [cleanTypedCode]);
 
   const displayedPills = useMemo(() => {
-    const base = searchResults.length > 0 ? searchResults : ALL_MINIFIG_CATALOG;
+    const base = hybridResults.length > 0 ? hybridResults : ALL_MINIFIG_CATALOG;
     const selectedAlreadyVisible = base.some((m) => m.figId === selectedMinifig.figId);
-    return selectedAlreadyVisible ? base : [selectedMinifig, ...base];
-  }, [searchResults, selectedMinifig]);
-
-  const report = useMemo(
-    () =>
-      generatePriceComparisonReport(
-        selectedMinifig,
-        selectedCondition,
-        preferredPriceSource
-      ),
-    [selectedMinifig, selectedCondition, preferredPriceSource]
-  );
+    return (selectedAlreadyVisible ? base : [selectedMinifig, ...base]).slice(0, 18);
+  }, [hybridResults, selectedMinifig]);
 
   useEffect(() => {
-    setMarketPriceInput(report.estimatedMarketValueEur.toFixed(2));
-  }, [selectedMinifig.figId, selectedCondition, report.estimatedMarketValueEur]);
+    setMarketPriceInput(activeReport.estimatedMarketValueEur.toFixed(2));
+  }, [selectedMinifig.figId, selectedCondition, activeReport.estimatedMarketValueEur]);
 
   const dualPrices = useMemo(
     () => getQuickDualPricesEur(selectedMinifig, preferredPriceSource),
     [selectedMinifig, preferredPriceSource]
   );
-
-  const partsSumEur = useMemo(
-    () =>
-      Math.round(selectedMinifig.parts.reduce((acc, p) => acc + p.avgPriceEur, 0) * 100) /
-      100,
-    [selectedMinifig]
-  );
-
-  const partOutDiffPct = useMemo(() => {
-    if (report.estimatedMarketValueEur <= 0) return 0;
-    return (
-      Math.round(
-        ((partsSumEur - report.estimatedMarketValueEur) /
-          report.estimatedMarketValueEur) *
-          1000
-      ) / 10
-    );
-  }, [partsSumEur, report.estimatedMarketValueEur]);
 
   const handleSelectCustomCode = (codeRaw: string) => {
     const clean = codeRaw.trim().replace(/\s+/g, '');
@@ -156,8 +163,8 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
     if (marketPriceInput.trim() !== '' && Number.isFinite(parsed) && parsed > 0) {
       return Math.round(parsed * 100) / 100;
     }
-    return report.estimatedMarketValueEur;
-  }, [marketPriceInput, report.estimatedMarketValueEur]);
+    return activeReport.estimatedMarketValueEur;
+  }, [marketPriceInput, activeReport.estimatedMarketValueEur]);
 
   const targetCollectionName = useMemo(() => {
     const found = collections.find((c) => c.id === targetCollectionId) ?? collections[0];
@@ -172,7 +179,7 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
         : Math.round(resolvedMarketValueEur * 0.8 * 100) / 100;
 
     const updatedMinifig: MinifigureMetadata =
-      Math.abs(resolvedMarketValueEur - report.estimatedMarketValueEur) > 0.01
+      Math.abs(resolvedMarketValueEur - activeReport.estimatedMarketValueEur) > 0.01
         ? {
             ...selectedMinifig,
             baseMarketPriceEur: {
@@ -200,15 +207,15 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
   };
 
   return (
-    <section className="screen-stack" aria-label="Comparador de precios multi-portal">
-      {/* Buscador Rápido + Cotizador Universal de Código */}
+    <section className="screen-stack" aria-label="Tasar y buscar minifiguras">
+      {/* Buscador Universal (Catálogo local + Rebrickable + Código BrickLink) */}
       <div className="surface-card">
         <form
           className="search-bar-wrap"
           onSubmit={(e) => {
             e.preventDefault();
-            if (searchResults.length === 1) {
-              onChangeMinifig(searchResults[0]);
+            if (hybridResults.length === 1) {
+              onChangeMinifig(hybridResults[0]);
             } else if (canQuoteCustomCode) {
               handleSelectCustomCode(cleanTypedCode);
             }
@@ -219,10 +226,11 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
             type="search"
             id="comparator-search-input"
             className="search-input"
-            placeholder="Busca o escribe cualquier código BrickLink (ej. sw0999, hp0128)..."
+            placeholder="Busca figura o código BrickLink (ej. sw0999, vader)..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
+          {searchingLive && <Loader2 size={14} className="spin search-bar-spinner" />}
         </form>
 
         <div className="catalog-pills-scroll" role="list">
@@ -252,382 +260,214 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
         </div>
       </div>
 
-      {/* Tarjeta de Valor de Mercado Ponderado / Fuente Elegida */}
+      {/* Tarjeta Principal: Identidad + Estado + Media Desplegable */}
       <div className="surface-card">
-        <div className="hero-fig-row">
+        <div className="comp-fig-header">
           <img
             src={selectedMinifig.imageUrl}
             alt={selectedMinifig.name}
-            className="hero-fig-thumb"
+            className="comp-fig-avatar"
           />
-          <div>
-            <div className="fig-meta-line" style={{ marginTop: 0 }}>
-              <span className="code-chip">{selectedMinifig.figId.toUpperCase()}</span>
-              <span>{selectedMinifig.theme}</span>
-              <span>· {selectedMinifig.yearReleased}</span>
+          <div className="comp-fig-meta">
+            <div className="fig-id-row">
+              <span className="fig-code-badge mono">{selectedMinifig.figId.toUpperCase()}</span>
+              <span className="fig-theme-label">{selectedMinifig.theme}</span>
+              <span className="fig-year-label">· {selectedMinifig.yearReleased}</span>
             </div>
-            <h2 className="fig-title-lg">{selectedMinifig.name}</h2>
+            <h2 className="comp-fig-title">{selectedMinifig.name}</h2>
+            <button
+              type="button"
+              id="btn-open-detail-from-comparator"
+              className="inline-parts-link"
+              onClick={() => onOpenMinifigDetail(selectedMinifig, selectedCondition)}
+            >
+              <Puzzle size={13} />
+              <span>Ver despiece ({selectedMinifig.parts.length} piezas) y faltantes →</span>
+            </button>
           </div>
         </div>
 
-        <div
-          className="segmented-control"
-          role="radiogroup"
-          aria-label="Filtrar estado en portales"
-          style={{ marginTop: 12 }}
-        >
+        {/* Selector de condición */}
+        <div className="condition-segmented-grid" style={{ marginTop: '14px' }}>
           {(
             [
-              { id: 'new', label: 'Nueva / Sellada', price: dualPrices.newEur },
-              { id: 'used_complete', label: 'Usada Completa', price: dualPrices.usedEur },
-              { id: 'used_incomplete', label: 'Incompleta', price: dualPrices.incompleteEur }
+              { id: 'new', label: 'Nueva', eur: dualPrices.newEur },
+              { id: 'used_complete', label: 'Usada Completa', eur: dualPrices.usedEur },
+              { id: 'used_incomplete', label: 'Incompleta', eur: dualPrices.incompleteEur }
             ] as const
-          ).map((c) => (
+          ).map((item) => (
             <button
-              key={c.id}
+              key={item.id}
               type="button"
-              id={`price-cond-${c.id}`}
-              className={`seg-option ${selectedCondition === c.id ? 'active' : ''}`}
-              onClick={() => onChangeCondition(c.id)}
+              id={`comp-cond-${item.id}`}
+              className={`condition-segment ${selectedCondition === item.id ? 'active' : ''}`}
+              onClick={() => onChangeCondition(item.id)}
             >
-              <span>{c.label}</span>
-              <strong>{c.price.toFixed(2)} €</strong>
+              <span>{item.label}</span>
+              <strong className="mono">{item.eur.toFixed(2)} €</strong>
             </button>
           ))}
         </div>
 
-        <div className="valuation-readout-row">
-          <div>
-            <span className="eyebrow">
-              {preferredPriceSource === 'weighted'
-                ? 'Valor de Mercado Ponderado'
-                : PREFERRED_PRICE_SOURCE_LABELS[preferredPriceSource]}
-            </span>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 2 }}>
-              <strong className="valuation-big-num mono" id="weighted-market-value">
-                {report.estimatedMarketValueEur.toFixed(2)} €
-              </strong>
-              <span className="trend-chip">
-                <TrendingUp size={12} /> +{report.trendPercentage30d.toFixed(1)}% (30d)
-              </span>
-            </div>
-            <span className="section-hint">
-              Horquilla: {report.priceRangeEur.low.toFixed(2)} € –{' '}
-              {report.priceRangeEur.high.toFixed(2)} €
-            </span>
-          </div>
-
-          <div className="best-deals-col">
-            <div>
-              <span className="eyebrow" style={{ display: 'block' }}>
-                Mejor compra
-              </span>
-              <strong className="mono" style={{ color: 'var(--positive)' }}>
-                {report.bestDealPortal.toUpperCase()}
-              </strong>
-            </div>
-            <div>
-              <span className="eyebrow" style={{ display: 'block' }}>
-                Mayor venta
-              </span>
-              <strong className="mono">{report.bestSalePortal.toUpperCase()}</strong>
-            </div>
-          </div>
+        {/* Media de mercado + desglose desplegable de los 5 portales */}
+        <div style={{ marginTop: '14px' }}>
+          <PriceAverageCard
+            minifig={selectedMinifig}
+            condition={selectedCondition}
+            preferredPriceSource={preferredPriceSource}
+            onReportChange={setActiveReport}
+          />
         </div>
 
-        {selectedMinifig.isEstimatedFallbackPrice && (
-          <p className="section-hint" style={{ marginTop: 6, color: 'var(--accent)' }}>
-            Referencia externa con precio base orientativo. Consulta los enlaces reales y ajusta el valor debajo antes de guardarla.
-          </p>
-        )}
-
-        <div className="source-select-row">
+        {/* Fuente preferida compacta */}
+        <div className="preferred-source-bar" style={{ marginTop: '12px' }}>
           <label htmlFor="preferred-price-source-select" className="eyebrow">
-            Fuente de precio base
+            Cálculo de media
           </label>
-          <select
-            id="preferred-price-source-select"
-            className="source-select-mini"
-            value={preferredPriceSource}
-            onChange={(e) =>
-              onChangePreferredSource(e.target.value as PreferredPriceSource)
-            }
-          >
-            {(
-              Object.entries(PREFERRED_PRICE_SOURCE_LABELS) as Array<
-                [PreferredPriceSource, string]
-              >
-            ).map(([key, label]) => (
-              <option key={key} value={key}>
-                {label}
-              </option>
-            ))}
-          </select>
-        </div>
-      </div>
-
-      {/* Comparativa Limpia por Portales (Separadores Hairline) */}
-      <div className="surface-card">
-        <div className="section-header-line">
-          <div>
-            <h3 className="section-title">Cotizaciones por Portal (5 Marketplaces)</h3>
-            <p className="section-hint">
-              Ponderación: 50% BrickLink · 25% BrickOwl · 15% eBay · 5% Wallapop · 5% Vinted
-            </p>
-          </div>
-        </div>
-
-        <div className="portal-list">
-          {report.quotes.map((q) => {
-            const isBestDeal = q.portal === report.bestDealPortal;
-            const totalSpan = Math.max(1, report.priceRangeEur.high - report.priceRangeEur.low);
-            const leftPct = Math.max(
-              0,
-              Math.min(84, ((q.minPriceEur - report.priceRangeEur.low) / totalSpan) * 100)
-            );
-            const widthPct = Math.max(
-              14,
-              Math.min(100 - leftPct, ((q.maxPriceEur - q.minPriceEur) / totalSpan) * 100)
-            );
-
-            return (
-              <div key={q.portal} id={`portal-quote-${q.portal}`} className="portal-row">
-                <div className="portal-row-top">
-                  <div className="portal-identity">
-                    <strong className="portal-title">{q.portalName}</strong>
-                    <span className="portal-source-tag">
-                      {q.isOfficialApi ? 'Price Guide' : 'C2C'}
-                    </span>
-                    {isBestDeal && <span className="best-buy-tag">Mejor compra</span>}
-                  </div>
-
-                  <a
-                    href={q.deepLinkUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    id={`link-portal-${q.portal}`}
-                    className="portal-open-link"
-                  >
-                    <span>Abrir ({q.activeListingsCount})</span>
-                    <ExternalLink size={12} />
-                  </a>
-                </div>
-
-                <div className="portal-numbers-row">
-                  <div>
-                    <span className="p-stat-label">Mínimo</span>
-                    <strong className="mono" style={{ color: 'var(--positive)' }}>
-                      {q.minPriceEur.toFixed(2)} €
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="p-stat-label">Media (6m)</span>
-                    <strong className="mono" style={{ color: 'var(--accent)' }}>
-                      {q.soldAvg6mEur.toFixed(2)} €
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="p-stat-label">Máximo</span>
-                    <strong className="mono">{q.maxPriceEur.toFixed(2)} €</strong>
-                  </div>
-                  <div>
-                    <span className="p-stat-label">Envío est.</span>
-                    <strong className="mono">+{q.shippingEstimateEur.toFixed(2)} €</strong>
-                  </div>
-                </div>
-
-                <div className="spectrum-track" aria-hidden="true">
-                  <div
-                    className="spectrum-bar"
-                    style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
-                  />
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        <div className="data-transparency-note">
-          <Info size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-          <span>
-            Los enlaces «Abrir» buscan directamente {selectedMinifig.figId.toUpperCase()} en cada portal real.
-          </span>
-        </div>
-      </div>
-
-      {/* Desglose por Piezas Colapsable + Veredicto Part-Out */}
-      <div className="surface-card">
-        <details className="optical-disclosure">
-          <summary>
-            <span>Desglose por piezas sueltas (Part-Out: {partsSumEur.toFixed(2)} €)</span>
-            <ChevronDown size={15} />
-          </summary>
-          <div style={{ marginTop: 10 }}>
-            <div
-              id="part-out-verdict"
-              className={`verdict-pill ${partOutDiffPct >= 5 ? 'partout' : 'complete'}`}
+          <div className="select-wrap">
+            <select
+              id="preferred-price-source-select"
+              className="compact-select"
+              value={preferredPriceSource}
+              onChange={(e) => onChangePreferredSource(e.target.value as PreferredPriceSource)}
             >
-              {partOutDiffPct >= 5
-                ? `Conviene vender por piezas (+${partOutDiffPct.toFixed(1)}% · +${(
-                    partsSumEur - report.estimatedMarketValueEur
-                  ).toFixed(2)} €)`
-                : `Mejor vender completa (${
-                    partOutDiffPct >= 0
-                      ? `+${partOutDiffPct.toFixed(1)}%`
-                      : `${partOutDiffPct.toFixed(1)}%`
-                  } en piezas)`}
-            </div>
-            {selectedMinifig.parts.map((part) => (
-              <div key={part.partNum} className="part-row-flat">
-                <div>
-                  <span className="mono" style={{ color: 'var(--text-muted)', marginRight: 8 }}>
-                    {part.partNum}
-                  </span>
-                  <span>{part.name}</span>
-                </div>
-                <strong className="mono">{part.avgPriceEur.toFixed(2)} €</strong>
-              </div>
-            ))}
+              {(Object.keys(PREFERRED_PRICE_SOURCE_LABELS) as PreferredPriceSource[]).map((src) => (
+                <option key={src} value={src}>
+                  {PREFERRED_PRICE_SOURCE_LABELS[src]}
+                </option>
+              ))}
+            </select>
+            <ChevronDown size={14} className="select-chevron" />
           </div>
-        </details>
+        </div>
       </div>
 
-      {/* Guardar en Colección Destino */}
-      <form className="surface-card" onSubmit={handleConfirmAdd}>
-        <div className="section-header-line">
-          <h3 className="section-title">
-            Guardar {selectedMinifig.figId.toUpperCase()} en colección
-          </h3>
+      {/* Guardar directamente en colección */}
+      <form className="surface-card comp-add-form" onSubmit={handleConfirmAdd}>
+        <div className="target-collection-row">
+          <div className="target-col-select-wrap">
+            <label htmlFor="comp-target-collection">Guardar en colección</label>
+            <select
+              id="comp-target-collection"
+              className="compact-select"
+              value={targetCollectionId ?? ''}
+              onChange={(e) => {
+                setTargetCollectionId(e.target.value);
+                onSelectCollection(e.target.value);
+              }}
+            >
+              {collections.length === 0 ? (
+                <option value="">Mi Colección (nueva)</option>
+              ) : (
+                collections.map((col) => (
+                  <option key={col.id} value={col.id}>
+                    {col.name}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+
+          <button
+            type="button"
+            className="btn-secondary-inline"
+            onClick={() => setCreatingCollectionMode((v) => !v)}
+            title="Crear nueva colección"
+          >
+            <FolderPlus size={14} /> Nueva
+          </button>
         </div>
 
-        <div className="target-collection-row" style={{ marginBottom: 10 }}>
-          <label htmlFor="comp-target-col" className="eyebrow">
-            Colección destino
-          </label>
-          <div className="target-collection-controls">
-            {collections.length > 0 ? (
-              <select
-                id="comp-target-col"
-                className="source-select-mini"
-                value={targetCollectionId ?? collections[0].id}
-                onChange={(e) => {
-                  setTargetCollectionId(e.target.value);
-                  onSelectCollection(e.target.value);
-                }}
-              >
-                {collections.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                    {c.isDemo ? ' (Prueba)' : ''}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <span className="section-hint">Se creará «Mi Colección»</span>
-            )}
+        {creatingCollectionMode && (
+          <div className="inline-new-col-form">
+            <input
+              type="text"
+              className="text-input"
+              placeholder="Ej. Star Wars, Vitrina..."
+              value={newCollectionName}
+              onChange={(e) => setNewCollectionName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void handleCreateTargetCollection(e);
+                }
+              }}
+            />
             <button
               type="button"
-              className="btn-chip"
-              onClick={() => setCreatingCollectionMode((v) => !v)}
+              className="btn-primary-inline"
+              onClick={(e) => void handleCreateTargetCollection(e)}
             >
-              <FolderPlus size={12} />
-              <span>Nueva</span>
+              Crear
             </button>
           </div>
+        )}
 
-          {creatingCollectionMode && (
-            <div className="inline-create-bar">
-              <input
-                type="text"
-                className="field-input"
-                placeholder="Nombre de tu colección..."
-                value={newCollectionName}
-                onChange={(e) => setNewCollectionName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    void handleCreateTargetCollection(e);
-                  }
-                }}
-              />
-              <button
-                type="button"
-                className="btn-chip active"
-                onClick={(e) => void handleCreateTargetCollection(e)}
-              >
-                Crear
-              </button>
-            </div>
-          )}
-        </div>
-
-        <div className="form-grid-3">
-          <div className="field-group" style={{ marginBottom: 0 }}>
-            <label htmlFor="add-qty-input">Cantidad</label>
+        <div className="comp-add-grid three-cols">
+          <div className="sheet-field">
+            <label htmlFor="comp-qty-input">Uds.</label>
             <input
-              id="add-qty-input"
+              id="comp-qty-input"
               type="number"
-              className="field-input mono"
               min={1}
               max={999}
+              className="text-input mono"
               value={quantityToAdd}
               onChange={(e) => setQuantityToAdd(Math.max(1, Number(e.target.value) || 1))}
             />
           </div>
 
-          <div className="field-group" style={{ marginBottom: 0 }}>
-            <label htmlFor="add-paid-input">Pagado / ud. (€)</label>
+          <div className="sheet-field">
+            <label htmlFor="comp-paid-input">Pagado (€)</label>
             <input
-              id="add-paid-input"
+              id="comp-paid-input"
               type="number"
-              className="field-input mono"
-              step="0.01"
-              min={0}
-              placeholder={`${(resolvedMarketValueEur * 0.8).toFixed(2)}`}
+              step="0.5"
+              min="0"
+              className="text-input mono"
+              placeholder={(resolvedMarketValueEur * 0.8).toFixed(2)}
               value={purchasePriceInput}
               onChange={(e) => setPurchasePriceInput(e.target.value)}
             />
           </div>
 
-          <div className="field-group" style={{ marginBottom: 0 }}>
-            <label htmlFor="add-market-input">Valor / ud. (€)</label>
+          <div className="sheet-field">
+            <label htmlFor="comp-market-input">Valor (€)</label>
             <input
-              id="add-market-input"
+              id="comp-market-input"
               type="number"
-              className="field-input mono"
-              step="0.01"
-              min={0.5}
+              step="0.5"
+              min="0.5"
+              className="text-input mono"
               value={marketPriceInput}
               onChange={(e) => setMarketPriceInput(e.target.value)}
             />
           </div>
         </div>
 
-        <div className="field-group" style={{ marginTop: 10 }}>
-          <label htmlFor="add-notes-input">Notas (opcional)</label>
+        <div className="sheet-field">
+          <label htmlFor="comp-notes-input">Notas opcionales</label>
           <input
-            id="add-notes-input"
+            id="comp-notes-input"
             type="text"
-            className="field-input"
-            placeholder="Ej: Comprada en Wallapop completa..."
+            className="text-input"
+            placeholder="Ej. Comprada en Wallapop, estado 9/10..."
             value={notesInput}
             onChange={(e) => setNotesInput(e.target.value)}
           />
         </div>
 
-        {savedNotice && (
-          <div className="feedback-banner" role="status" style={{ marginBottom: 10 }}>
-            <Check size={16} />
-            <span>{savedNotice}</span>
-          </div>
-        )}
-
-        <button type="submit" id="btn-submit-add-collection" className="btn-primary btn-full">
-          <PlusCircle size={16} />
-          <span>
-            Guardar en «{targetCollectionName}» (
-            {(quantityToAdd * resolvedMarketValueEur).toFixed(2)} €)
-          </span>
+        <button type="submit" id="btn-comp-add-collection" className="btn-primary full-width">
+          {savedNotice ? (
+            <>
+              <Check size={16} /> {savedNotice}
+            </>
+          ) : (
+            <>
+              <PlusCircle size={16} /> Guardar en «{targetCollectionName}» (
+              {(resolvedMarketValueEur * quantityToAdd).toFixed(2)} €)
+            </>
+          )}
         </button>
       </form>
     </section>

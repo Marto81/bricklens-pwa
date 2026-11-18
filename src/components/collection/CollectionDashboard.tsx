@@ -12,6 +12,7 @@ import {
   Minus,
   Pencil,
   Plus,
+  Puzzle,
   RefreshCw,
   Search,
   Share2,
@@ -80,6 +81,7 @@ interface CollectionDashboardProps {
     notes: string
   ) => void;
   onRemoveItem: (itemId: string) => void;
+  onOpenItemDetail: (item: CollectionItem) => void;
   onInspectInComparator: (minifig: MinifigureMetadata, condition: MinifigCondition) => void;
   onRefreshValuations: () => void;
   onBulkImportLines: (lines: BulkImportParsedLine[]) => void;
@@ -109,6 +111,7 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
   onUpdateCondition,
   onUpdateItemDetails,
   onRemoveItem,
+  onOpenItemDetail,
   onInspectInComparator,
   onRefreshValuations,
   onBulkImportLines,
@@ -1291,6 +1294,8 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                 const lineCostEur = item.quantity * item.purchasePriceEur;
                 const lineProfitEur = lineTotalEur - lineCostEur;
                 const isEditing = editingItemId === item.id;
+                const missingCount = item.missingPartNums?.length ?? 0;
+                const totalPartsCount = item.minifig.parts.length;
 
                 return (
                   <article
@@ -1298,7 +1303,18 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                     id={`collection-card-${item.minifig.figId}-${item.condition}`}
                     className="collection-row-card"
                   >
-                    <div className="c-item-top">
+                    <div
+                      className="c-item-top clickable"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => onOpenItemDetail(item)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          onOpenItemDetail(item);
+                        }
+                      }}
+                    >
                       <img
                         src={item.minifig.imageUrl}
                         alt={item.minifig.name}
@@ -1308,6 +1324,11 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                         <div className="fig-meta-line" style={{ marginTop: 0 }}>
                           <span className="code-chip">{item.minifig.figId.toUpperCase()}</span>
                           <span>{item.minifig.theme}</span>
+                          {missingCount > 0 && (
+                            <span className="missing-parts-pill">
+                              {Math.max(0, totalPartsCount - missingCount)}/{totalPartsCount} piezas
+                            </span>
+                          )}
                         </div>
                         <h3 className="c-item-title">{item.minifig.name}</h3>
                         {item.missingPartsNotes && (
@@ -1442,6 +1463,17 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <button
                           type="button"
+                          id={`btn-open-parts-${item.minifig.figId}`}
+                          className={`btn-chip ${missingCount > 0 ? 'active' : ''}`}
+                          title="Abrir ficha y despiece interactivo"
+                          onClick={() => onOpenItemDetail(item)}
+                        >
+                          <Puzzle size={12} />
+                          <span>Despiece</span>
+                        </button>
+
+                        <button
+                          type="button"
                           className="btn-chip"
                           title="Editar valoración, precio o notas"
                           onClick={() => startEditingItem(item)}
@@ -1452,9 +1484,10 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                         <button
                           type="button"
                           className="btn-chip"
+                          title="Ver en Tasar"
                           onClick={() => onInspectInComparator(item.minifig, item.condition)}
                         >
-                          5 Portales
+                          Tasar
                         </button>
 
                         <button

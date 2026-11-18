@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   BarChart3,
   Camera,
   Layers,
   Moon,
-  Sun,
-  Wifi,
-  WifiOff
+  Settings,
+  Sun
 } from 'lucide-react';
 import type {
+  AppSettings,
   BulkImportParsedLine,
   CollectionItem,
   MinifigCondition,
@@ -17,25 +17,27 @@ import type {
   UserCollection
 } from './types/minifig';
 import { MINIFIG_CATALOG } from './data/catalogPresets';
+import { calculateCollectionStats, db } from './db/collectionDb';
+import { setRuntimeProxyBaseUrl } from './services/apiConfig';
 import {
-  bulkUpsertCollectionItems,
-  calculateCollectionStats,
-  createCollection,
-  db,
-  deleteCollection,
-  initializeCollections,
-  renameCollection,
-  restoreDemoCollection,
-  setActiveCollectionId as persistActiveCollectionId,
-  upsertCollectionMinifig
-} from './db/collectionDb';
-import { generatePriceComparisonReport } from './services/priceAggregator';
+  computeMissingPartsAdjustment,
+  generatePriceComparisonReport
+} from './services/priceAggregator';
+import { storageRepository } from './services/storageRepository';
 import { CameraScanner } from './components/scanner/CameraScanner';
 import { PriceComparisonView } from './components/prices/PriceComparisonView';
 import { CollectionDashboard } from './components/collection/CollectionDashboard';
+import { MinifigDetailSheet } from './components/shared/MinifigDetailSheet';
+import { SettingsSheet } from './components/settings/SettingsSheet';
 
 type ActiveTab = 'scanner' | 'comparator' | 'collection';
 type ThemeMode = 'dark' | 'light';
+
+const DEFAULT_SETTINGS: AppSettings = {
+  proxyBaseUrl: '',
+  defaultTargetMarginPct: 35,
+  preferredPriceSource: 'weighted'
+};
 
 export function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('scanner');
@@ -43,6 +45,21 @@ export function App() {
   const [selectedMinifig, setSelectedMinifig] = useState<MinifigureMetadata>(MINIFIG_CATALOG[0]);
   const [selectedCondition, setSelectedCondition] = useState<MinifigCondition>('used_complete');
   const [preferredPriceSource, setPreferredPriceSource] = useState<PreferredPriceSource>('weighted');
+
+  const [appSettings, setAppSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const [detailModal, setDetailModal] = useState<{
+    open: boolean;
+    minifig: MinifigureMetadata | null;
+    collectionItemId?: string | null;
+    condition?: MinifigCondition;
+  }>({
+    open: false,
+    minifig: null,
+    collectionItemId: null,
+    condition: 'used_complete'
+  });
 
   const [collections, setCollections] = useState<UserCollection[]>([]);
   const [activeCollectionId, setActiveCollectionId] = useState<string | null>(null);
@@ -54,7 +71,7 @@ export function App() {
   }, [themeMode]);
 
   useEffect(() => {
-    void loadCollectionsAndItems();
+    void bootstrapApp();
 
     const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
@@ -66,33 +83,37 @@ export function App() {
     };
   }, []);
 
-  const loadCollectionsAndItems = async () => {
-    const state = await initializeCollections();
+  const bootstrapApp = async () => {
+    const [state, settings] = await Promise.all([
+      storageRepository.initialize(),
+      storageRepository.getSettings()
+    ]);
     setCollections(state.collections);
     setActiveCollectionId(state.activeCollectionId);
     setAllItems(state.allItems);
+    setAppSettings(settings);
+    setPreferredPriceSource(settings.preferredPriceSource);
+    setRuntimeProxyBaseUrl(settings.proxyBaseUrl);
   };
 
   const syncFromDatabase = async (overrideActiveId?: string | null) => {
-    const [nextCollections, nextItems] = await Promise.all([
-      db.collections.orderBy('createdAtIso').toArray(),
-      db.collectionItems.toArray()
-    ]);
+    const { collections: nextCollections, items: nextItems } =
+      await storageRepository.listCollectionsAndItems();
     setCollections(nextCollections);
     setAllItems(nextItems);
     if (overrideActiveId !== undefined) {
       setActiveCollectionId(overrideActiveId);
-      await persistActiveCollectionId(overrideActiveId);
+      await storageRepository.setActiveCollection(overrideActiveId);
     } else if (
       activeCollectionId &&
       !nextCollections.some((c) => c.id === activeCollectionId)
     ) {
       const fallbackId = nextCollections[0]?.id ?? null;
       setActiveCollectionId(fallbackId);
-      await persistActiveCollectionId(fallbackId);
+      await storageRepository.setActiveCollection(fallbackId);
     } else if (!activeCollectionId && nextCollections.length > 0) {
       setActiveCollectionId(nextCollections[0].id);
-      await persistActiveCollectionId(nextCollections[0].id);
+      await storageRepository.setActiveCollection(nextCollections[0].id);
     }
   };
 
@@ -114,29 +135,37 @@ export function App() {
     [activeCollectionItems]
   );
 
+  const activeDetailCollectionItem = useMemo(
+    () =>
+      detailModal.collectionItemId
+        ? allItems.find((it) => it.id === detailModal.collectionItemId) ?? null
+        : null,
+    [allItems, detailModal.collectionItemId]
+  );
+
   const handleSelectCollection = async (collectionId: string) => {
     setActiveCollectionId(collectionId);
-    await persistActiveCollectionId(collectionId);
+    await storageRepository.setActiveCollection(collectionId);
   };
 
   const handleCreateCollection = async (name: string): Promise<UserCollection> => {
-    const created = await createCollection(name);
+    const created = await storageRepository.createCollection(name);
     await syncFromDatabase(created.id);
     return created;
   };
 
   const handleRenameCollection = async (collectionId: string, newName: string) => {
-    await renameCollection(collectionId, newName);
+    await storageRepository.renameCollection(collectionId, newName);
     await syncFromDatabase();
   };
 
   const handleDeleteCollection = async (collectionId: string) => {
-    const nextActiveId = await deleteCollection(collectionId);
+    const nextActiveId = await storageRepository.deleteCollection(collectionId);
     await syncFromDatabase(nextActiveId);
   };
 
   const handleRestoreDemoCollection = async () => {
-    const { collection } = await restoreDemoCollection();
+    const { collection } = await storageRepository.restoreDemoCollection();
     await syncFromDatabase(collection.id);
   };
 
@@ -149,6 +178,35 @@ export function App() {
     setActiveTab('comparator');
   };
 
+  const handleOpenMinifigDetail = useCallback(
+    (minifig: MinifigureMetadata, condition: MinifigCondition = 'used_complete') => {
+      setDetailModal({
+        open: true,
+        minifig,
+        collectionItemId: null,
+        condition
+      });
+    },
+    []
+  );
+
+  const handleOpenCollectionItemDetail = useCallback((item: CollectionItem) => {
+    setDetailModal({
+      open: true,
+      minifig: item.minifig,
+      collectionItemId: item.id,
+      condition: item.condition
+    });
+  }, []);
+
+  const handleCloseDetailSheet = useCallback(() => {
+    setDetailModal((prev) => ({ ...prev, open: false }));
+  }, []);
+
+  const handleCloseSettingsSheet = useCallback(() => {
+    setSettingsOpen(false);
+  }, []);
+
   const handleQuickAddFromScanner = async (
     minifig: MinifigureMetadata,
     condition: MinifigCondition,
@@ -158,7 +216,7 @@ export function App() {
     targetCollectionId?: string | null
   ) => {
     const report = generatePriceComparisonReport(minifig, condition, preferredPriceSource);
-    const saved = await upsertCollectionMinifig({
+    const saved = await storageRepository.upsertMinifig({
       collectionId: targetCollectionId ?? activeCollectionId,
       minifig,
       condition,
@@ -175,7 +233,7 @@ export function App() {
     targetCollectionId?: string | null
   ) => {
     if (lines.length === 0) return;
-    const saved = await bulkUpsertCollectionItems(
+    const saved = await storageRepository.bulkUpsert(
       lines,
       targetCollectionId ?? activeCollectionId
     );
@@ -190,9 +248,10 @@ export function App() {
     quantity: number;
     purchasePriceEur: number;
     estimatedUnitValueEur: number;
+    missingPartNums?: string[];
     notes?: string;
   }) => {
-    const saved = await upsertCollectionMinifig({
+    const saved = await storageRepository.upsertMinifig({
       ...params,
       collectionId: params.collectionId ?? activeCollectionId
     });
@@ -221,6 +280,10 @@ export function App() {
     await db.collectionItems.update(itemId, {
       condition: newCondition,
       estimatedUnitValueEur: report.estimatedMarketValueEur,
+      baseCompleteUnitValueEur:
+        newCondition !== 'used_incomplete'
+          ? report.estimatedMarketValueEur
+          : item.baseCompleteUnitValueEur,
       lastValuationIso: new Date().toISOString()
     });
     await syncFromDatabase();
@@ -255,6 +318,15 @@ export function App() {
     await syncFromDatabase();
   };
 
+  const handleUpdateCollectionItemMissingParts = async (
+    itemId: string,
+    missingPartNums: string[],
+    enrichedMinifig?: MinifigureMetadata
+  ) => {
+    await storageRepository.updateMissingParts(itemId, missingPartNums, enrichedMinifig);
+    await syncFromDatabase();
+  };
+
   const handleRemoveItem = async (itemId: string) => {
     await db.collectionItems.delete(itemId);
     await syncFromDatabase();
@@ -269,9 +341,32 @@ export function App() {
       .toArray();
     const nowIso = new Date().toISOString();
     const updated = current.map((item) => {
+      const hasMissing = Boolean(item.missingPartNums && item.missingPartNums.length > 0);
+      if (hasMissing) {
+        const completeRef = generatePriceComparisonReport(
+          item.minifig,
+          'used_complete',
+          activeSource
+        ).estimatedMarketValueEur;
+        const adj = computeMissingPartsAdjustment(
+          completeRef,
+          item.minifig.parts,
+          item.missingPartNums
+        );
+        return {
+          ...item,
+          baseCompleteUnitValueEur: completeRef,
+          estimatedUnitValueEur: adj.adjustedValueEur,
+          lastValuationIso: nowIso
+        };
+      }
       const report = generatePriceComparisonReport(item.minifig, item.condition, activeSource);
       return {
         ...item,
+        baseCompleteUnitValueEur:
+          item.condition !== 'used_incomplete'
+            ? report.estimatedMarketValueEur
+            : item.baseCompleteUnitValueEur,
         estimatedUnitValueEur: report.estimatedMarketValueEur,
         lastValuationIso: nowIso
       };
@@ -282,14 +377,20 @@ export function App() {
 
   const handleChangePreferredSource = async (nextSource: PreferredPriceSource) => {
     setPreferredPriceSource(nextSource);
+    const saved = await storageRepository.saveSettings({ preferredPriceSource: nextSource });
+    setAppSettings(saved);
     await handleRefreshValuations(nextSource);
   };
 
-  const pillLabel = activeCollection
-    ? activeCollection.name.length > 13
-      ? `${activeCollection.name.slice(0, 12)}…`
-      : activeCollection.name
-    : 'Sin colección';
+  const handleBackupRestored = async (nextActiveId: string | null) => {
+    const nextSettings = await storageRepository.getSettings();
+    setAppSettings(nextSettings);
+    setPreferredPriceSource(nextSettings.preferredPriceSource);
+    setRuntimeProxyBaseUrl(nextSettings.proxyBaseUrl);
+    await syncFromDatabase(nextActiveId);
+  };
+
+  const pillLabel = activeCollection ? activeCollection.name : 'Sin colección';
 
   return (
     <div className="app-shell">
@@ -301,7 +402,9 @@ export function App() {
           </div>
           <div>
             <h1 className="app-title">BrickLens</h1>
-            <span className="app-subtitle">Tasación LEGO</span>
+            <span className="app-subtitle">
+              {isOnline ? 'Tasación LEGO' : 'Offline · Local'}
+            </span>
           </div>
         </div>
 
@@ -332,13 +435,16 @@ export function App() {
             {themeMode === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
           </button>
 
-          <span
+          <button
+            type="button"
+            id="btn-open-settings"
             className="icon-btn"
-            style={{ color: isOnline ? 'var(--positive)' : 'var(--accent)', cursor: 'default' }}
-            title={isOnline ? 'En línea · IndexedDB activo' : 'Sin conexión · IndexedDB Offline'}
+            onClick={() => setSettingsOpen(true)}
+            title="Ajustes, APIs en vivo y Backup JSON"
+            aria-label="Abrir ajustes y copia de seguridad"
           >
-            {isOnline ? <Wifi size={14} /> : <WifiOff size={14} />}
-          </span>
+            <Settings size={15} />
+          </button>
         </div>
       </header>
 
@@ -346,11 +452,13 @@ export function App() {
         {activeTab === 'scanner' && (
           <CameraScanner
             preferredPriceSource={preferredPriceSource}
+            defaultTargetMarginPct={appSettings.defaultTargetMarginPct}
             collections={collections}
             activeCollectionId={activeCollectionId}
             onSelectCollection={(id) => void handleSelectCollection(id)}
             onCreateCollection={handleCreateCollection}
             onSelectMinifigForComparison={handleSelectForComparison}
+            onOpenMinifigDetail={handleOpenMinifigDetail}
             onQuickAddToCollection={handleQuickAddFromScanner}
             onBulkAddToCollection={handleBulkAddToCollection}
           />
@@ -368,6 +476,7 @@ export function App() {
             onChangePreferredSource={(src) => void handleChangePreferredSource(src)}
             onChangeMinifig={setSelectedMinifig}
             onChangeCondition={setSelectedCondition}
+            onOpenMinifigDetail={handleOpenMinifigDetail}
             onAddToCollection={handleAddToCollectionFromComparator}
           />
         )}
@@ -389,6 +498,7 @@ export function App() {
             onUpdateCondition={handleUpdateCondition}
             onUpdateItemDetails={handleUpdateItemDetails}
             onRemoveItem={handleRemoveItem}
+            onOpenItemDetail={handleOpenCollectionItemDetail}
             onInspectInComparator={handleSelectForComparison}
             onRefreshValuations={() => void handleRefreshValuations()}
             onBulkImportLines={(lines) => void handleBulkAddToCollection(lines, activeCollectionId)}
@@ -425,7 +535,7 @@ export function App() {
           onClick={() => setActiveTab('comparator')}
         >
           <BarChart3 size={20} />
-          <span>5 Portales</span>
+          <span>Tasar</span>
         </button>
 
         <button
@@ -441,6 +551,30 @@ export function App() {
           <span>Colecciones</span>
         </button>
       </nav>
+
+      {/* Bottom-Sheet Global de Detalle y Despiece Interactivo */}
+      <MinifigDetailSheet
+        open={detailModal.open}
+        minifig={activeDetailCollectionItem?.minifig ?? detailModal.minifig}
+        collectionItem={activeDetailCollectionItem}
+        initialCondition={detailModal.condition}
+        preferredPriceSource={preferredPriceSource}
+        collections={collections}
+        activeCollectionId={activeCollectionId}
+        onClose={handleCloseDetailSheet}
+        onUpdateCollectionItemMissingParts={handleUpdateCollectionItemMissingParts}
+        onUpdateCollectionItemDetails={handleUpdateItemDetails}
+        onAddNewToCollection={handleAddToCollectionFromComparator}
+      />
+
+      {/* Bottom-Sheet de Ajustes, Diagnóstico de APIs y Backup JSON */}
+      <SettingsSheet
+        open={settingsOpen}
+        settings={appSettings}
+        onClose={handleCloseSettingsSheet}
+        onSettingsChange={setAppSettings}
+        onBackupRestored={handleBackupRestored}
+      />
     </div>
   );
 }

@@ -1,10 +1,15 @@
 import Dexie, { type Table } from 'dexie';
 import type {
+  AppSettings,
+  BrickLensBackupPayload,
   BulkImportParsedLine,
+  CatalogCacheRecord,
   CollectionItem,
   CollectionStats,
+  MarketplaceId,
   MinifigCondition,
   MinifigureMetadata,
+  ObservedPriceRecord,
   PortfolioHistoryPoint,
   PortfolioTimeRange,
   PreferredPriceSource,
@@ -17,6 +22,7 @@ import {
   MINIFIG_CATALOG
 } from '../data/catalogPresets';
 import {
+  computeMissingPartsAdjustment,
   evaluateBulkTextList,
   generatePriceComparisonReport
 } from '../services/priceAggregator';
@@ -33,6 +39,8 @@ export class BrickLensDatabase extends Dexie {
   collections!: Table<UserCollection, string>;
   collectionItems!: Table<CollectionItem, string>;
   appMeta!: Table<AppMetaRow, string>;
+  observedPrices!: Table<ObservedPriceRecord, string>;
+  catalogCache!: Table<CatalogCacheRecord, string>;
 
   constructor() {
     super('BrickLensCollectionDB');
@@ -72,6 +80,14 @@ export class BrickLensDatabase extends Dexie {
             .put({ key: 'activeCollectionId', value: DEMO_COLLECTION_ID });
         }
       });
+    this.version(3).stores({
+      collections: 'id, createdAtIso',
+      collectionItems:
+        'id, collectionId, minifig.figId, minifig.theme, condition, addedAtIso',
+      appMeta: 'key',
+      observedPrices: 'key, figId, [figId+condition], updatedAtIso',
+      catalogCache: 'figId, updatedAtIso'
+    });
   }
 }
 
@@ -382,23 +398,38 @@ export async function upsertCollectionMinifig(params: {
   quantity: number;
   purchasePriceEur: number;
   estimatedUnitValueEur?: number;
+  missingPartNums?: string[];
   notes?: string;
 }): Promise<CollectionItem> {
   const targetCollectionId = await resolveTargetCollectionId(params.collectionId);
+
+  const missingPartNums = params.missingPartNums?.filter(Boolean);
+  const effectiveCondition: MinifigCondition =
+    missingPartNums && missingPartNums.length > 0 ? 'used_incomplete' : params.condition;
 
   const existing = await db.collectionItems
     .where('collectionId')
     .equals(targetCollectionId)
     .filter(
       (item) =>
-        item.minifig.figId === params.minifig.figId && item.condition === params.condition
+        item.minifig.figId === params.minifig.figId && item.condition === effectiveCondition
     )
     .first();
 
   const now = new Date().toISOString();
-  const unitValue =
+  const baseCompleteRef =
+    params.condition === 'new'
+      ? generatePriceComparisonReport(params.minifig, 'new').estimatedMarketValueEur
+      : generatePriceComparisonReport(params.minifig, 'used_complete').estimatedMarketValueEur;
+
+  let unitValue =
     params.estimatedUnitValueEur ??
-    generatePriceComparisonReport(params.minifig, params.condition).estimatedMarketValueEur;
+    generatePriceComparisonReport(params.minifig, effectiveCondition).estimatedMarketValueEur;
+
+  if (missingPartNums && missingPartNums.length > 0 && params.estimatedUnitValueEur === undefined) {
+    const adj = computeMissingPartsAdjustment(baseCompleteRef, params.minifig.parts, missingPartNums);
+    unitValue = adj.adjustedValueEur;
+  }
 
   if (existing) {
     const updatedQuantity = existing.quantity + params.quantity;
@@ -413,6 +444,8 @@ export async function upsertCollectionMinifig(params: {
       quantity: updatedQuantity,
       purchasePriceEur: weightedPurchase,
       estimatedUnitValueEur: unitValue,
+      baseCompleteUnitValueEur: existing.baseCompleteUnitValueEur ?? baseCompleteRef,
+      missingPartNums: missingPartNums ?? existing.missingPartNums,
       lastValuationIso: now,
       missingPartsNotes: params.notes || existing.missingPartsNotes
     };
@@ -422,13 +455,16 @@ export async function upsertCollectionMinifig(params: {
   }
 
   const created: CollectionItem = {
-    id: `item-${targetCollectionId}-${params.minifig.figId}-${params.condition}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    id: `item-${targetCollectionId}-${params.minifig.figId}-${effectiveCondition}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
     collectionId: targetCollectionId,
     minifig: params.minifig,
-    condition: params.condition,
+    condition: effectiveCondition,
     quantity: params.quantity,
     purchasePriceEur: params.purchasePriceEur,
     estimatedUnitValueEur: unitValue,
+    baseCompleteUnitValueEur:
+      effectiveCondition === 'used_incomplete' ? baseCompleteRef : unitValue,
+    missingPartNums: missingPartNums && missingPartNums.length > 0 ? missingPartNums : undefined,
     lastValuationIso: now,
     missingPartsNotes: params.notes,
     addedAtIso: now
@@ -452,6 +488,7 @@ export async function bulkUpsertCollectionItems(
       quantity: line.quantity,
       purchasePriceEur: line.purchasePriceEur,
       estimatedUnitValueEur: line.estimatedUnitValueEur,
+      missingPartNums: line.missingPartNums,
       notes: line.notes
     });
   }
@@ -836,4 +873,252 @@ export function getPortfolioHistorySeries(
       investedEur: roundEur(currentInvested * (0.9 + 0.1 * progress))
     };
   });
+}
+
+/**
+ * Actualiza el checklist de piezas faltantes de una figura en colección y descuenta
+ * automáticamente el coste estimado de las piezas marcadas como faltantes.
+ */
+export async function updateItemMissingParts(
+  itemId: string,
+  missingPartNums: string[],
+  enrichedMinifig?: MinifigureMetadata
+): Promise<CollectionItem | null> {
+  const item = await db.collectionItems.get(itemId);
+  if (!item) return null;
+
+  const minifig = enrichedMinifig ?? item.minifig;
+  const cleanMissing = Array.from(new Set(missingPartNums.filter(Boolean)));
+  const baseComplete =
+    item.baseCompleteUnitValueEur ??
+    (item.condition === 'used_incomplete'
+      ? generatePriceComparisonReport(minifig, 'used_complete').estimatedMarketValueEur
+      : item.estimatedUnitValueEur);
+
+  const adjustment = computeMissingPartsAdjustment(baseComplete, minifig.parts, cleanMissing);
+  const nextCondition: MinifigCondition =
+    cleanMissing.length > 0
+      ? 'used_incomplete'
+      : item.condition === 'used_incomplete'
+      ? 'used_complete'
+      : item.condition;
+
+  const updated: CollectionItem = {
+    ...item,
+    minifig,
+    condition: nextCondition,
+    baseCompleteUnitValueEur: baseComplete,
+    missingPartNums: cleanMissing.length > 0 ? cleanMissing : undefined,
+    estimatedUnitValueEur: adjustment.adjustedValueEur,
+    lastValuationIso: new Date().toISOString()
+  };
+
+  await db.collectionItems.put(updated);
+  return updated;
+}
+
+export async function saveObservedPrice(params: {
+  figId: string;
+  condition: MinifigCondition;
+  portal: MarketplaceId;
+  priceEur: number;
+}): Promise<ObservedPriceRecord> {
+  const cleanFigId = params.figId.trim().toLowerCase();
+  const key = `${cleanFigId}:${params.condition}:${params.portal}`;
+  const record: ObservedPriceRecord = {
+    key,
+    figId: cleanFigId,
+    condition: params.condition,
+    portal: params.portal,
+    priceEur: Math.max(0.5, roundEur(params.priceEur)),
+    updatedAtIso: new Date().toISOString()
+  };
+  await db.observedPrices.put(record);
+  return record;
+}
+
+export async function deleteObservedPrice(
+  figId: string,
+  condition: MinifigCondition,
+  portal: MarketplaceId
+): Promise<void> {
+  const key = `${figId.trim().toLowerCase()}:${condition}:${portal}`;
+  await db.observedPrices.delete(key);
+}
+
+export async function getObservedPricesForFig(
+  figId: string,
+  condition: MinifigCondition
+): Promise<Partial<Record<MarketplaceId, number>>> {
+  const cleanFigId = figId.trim().toLowerCase();
+  const rows = await db.observedPrices
+    .where('[figId+condition]')
+    .equals([cleanFigId, condition])
+    .toArray();
+  const out: Partial<Record<MarketplaceId, number>> = {};
+  for (const row of rows) {
+    out[row.portal] = row.priceEur;
+  }
+  return out;
+}
+
+export const DEFAULT_APP_SETTINGS: AppSettings = {
+  proxyBaseUrl: '',
+  defaultTargetMarginPct: 35,
+  preferredPriceSource: 'weighted'
+};
+
+export async function getAppSettings(): Promise<AppSettings> {
+  const row = await db.appMeta.get('appSettings');
+  if (!row?.value) return { ...DEFAULT_APP_SETTINGS };
+  try {
+    const parsed = JSON.parse(row.value) as Partial<AppSettings>;
+    return {
+      proxyBaseUrl: typeof parsed.proxyBaseUrl === 'string' ? parsed.proxyBaseUrl : '',
+      defaultTargetMarginPct:
+        typeof parsed.defaultTargetMarginPct === 'number' &&
+        parsed.defaultTargetMarginPct >= 5 &&
+        parsed.defaultTargetMarginPct <= 75
+          ? parsed.defaultTargetMarginPct
+          : 35,
+      preferredPriceSource: parsed.preferredPriceSource || 'weighted'
+    };
+  } catch {
+    return { ...DEFAULT_APP_SETTINGS };
+  }
+}
+
+export async function saveAppSettings(partial: Partial<AppSettings>): Promise<AppSettings> {
+  const current = await getAppSettings();
+  const next: AppSettings = {
+    ...current,
+    ...partial
+  };
+  await db.appMeta.put({ key: 'appSettings', value: JSON.stringify(next) });
+  return next;
+}
+
+export async function clearApiCaches(): Promise<void> {
+  await db.catalogCache.clear();
+}
+
+/**
+ * Backup completo en 1 toque: exporta colecciones, figuras, despieces faltantes,
+ * precios anotados y configuración en un archivo JSON versionado.
+ */
+export async function exportFullBackupJson(): Promise<string> {
+  const [collections, collectionItems, observedPrices, settings, activeMeta] = await Promise.all([
+    db.collections.orderBy('createdAtIso').toArray(),
+    db.collectionItems.toArray(),
+    db.observedPrices.toArray(),
+    getAppSettings(),
+    db.appMeta.get('activeCollectionId')
+  ]);
+
+  const payload: BrickLensBackupPayload = {
+    schemaVersion: 2,
+    exportedAtIso: new Date().toISOString(),
+    app: 'BrickLens PWA',
+    settings,
+    activeCollectionId: activeMeta?.value ?? collections[0]?.id ?? null,
+    collections,
+    collectionItems,
+    observedPrices
+  };
+
+  return JSON.stringify(payload, null, 2);
+}
+
+/**
+ * Restaura un backup JSON completo de BrickLens en modo 'replace' (reemplazar todo)
+ * o 'merge' (combinar sin perder las colecciones actuales).
+ */
+export async function importFullBackupJson(
+  rawJson: string,
+  mode: 'replace' | 'merge' = 'replace'
+): Promise<{
+  collectionsCount: number;
+  itemsCount: number;
+  observedPricesCount: number;
+  activeCollectionId: string | null;
+}> {
+  let parsed: Partial<BrickLensBackupPayload>;
+  try {
+    parsed = JSON.parse(rawJson) as Partial<BrickLensBackupPayload>;
+  } catch {
+    throw new Error('El archivo seleccionado no es un JSON válido de BrickLens.');
+  }
+
+  if (
+    parsed.app !== 'BrickLens PWA' ||
+    !Array.isArray(parsed.collections) ||
+    !Array.isArray(parsed.collectionItems)
+  ) {
+    throw new Error('Formato de copia de seguridad no reconocido por BrickLens.');
+  }
+
+  const validCollections: UserCollection[] = parsed.collections.filter(
+    (c): c is UserCollection => Boolean(c && typeof c.id === 'string' && typeof c.name === 'string')
+  );
+  const validItems: CollectionItem[] = parsed.collectionItems.filter(
+    (it): it is CollectionItem =>
+      Boolean(it && typeof it.id === 'string' && typeof it.collectionId === 'string' && it.minifig?.figId)
+  );
+  const validObserved: ObservedPriceRecord[] = Array.isArray(parsed.observedPrices)
+    ? parsed.observedPrices.filter(
+        (o): o is ObservedPriceRecord =>
+          Boolean(o && typeof o.key === 'string' && typeof o.priceEur === 'number')
+      )
+    : [];
+
+  let nextActiveId: string | null = parsed.activeCollectionId ?? validCollections[0]?.id ?? null;
+
+  await db.transaction(
+    'rw',
+    db.collections,
+    db.collectionItems,
+    db.observedPrices,
+    db.appMeta,
+    async () => {
+      if (mode === 'replace') {
+        await db.collections.clear();
+        await db.collectionItems.clear();
+        await db.observedPrices.clear();
+      }
+      if (validCollections.length > 0) {
+        await db.collections.bulkPut(validCollections);
+      }
+      if (validItems.length > 0) {
+        await db.collectionItems.bulkPut(validItems);
+      }
+      if (validObserved.length > 0) {
+        await db.observedPrices.bulkPut(validObserved);
+      }
+      await db.appMeta.put({ key: 'demoSeeded', value: 'true' });
+
+      if (parsed.settings) {
+        await db.appMeta.put({
+          key: 'appSettings',
+          value: JSON.stringify({ ...DEFAULT_APP_SETTINGS, ...parsed.settings })
+        });
+      }
+
+      const allCols = await db.collections.orderBy('createdAtIso').toArray();
+      if (!nextActiveId || !allCols.some((c) => c.id === nextActiveId)) {
+        nextActiveId = allCols[0]?.id ?? null;
+      }
+      if (nextActiveId) {
+        await db.appMeta.put({ key: 'activeCollectionId', value: nextActiveId });
+      } else {
+        await db.appMeta.delete('activeCollectionId');
+      }
+    }
+  );
+
+  return {
+    collectionsCount: validCollections.length,
+    itemsCount: validItems.length,
+    observedPricesCount: validObserved.length,
+    activeCollectionId: nextActiveId
+  };
 }

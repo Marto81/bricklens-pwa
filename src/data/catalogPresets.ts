@@ -609,24 +609,31 @@ export function createCustomMinifigMetadata(params: {
     ],
     parts: [
       {
-        partNum: `${cleanId}-h`,
-        name: 'Cabeza / Casco',
+        partNum: `${cleanId}-hg`,
+        name: 'Casco / Pelo / Sombrero',
         category: 'headgear',
-        avgPriceEur: Math.round(estUsed * 0.34 * 100) / 100
+        avgPriceEur: Math.round(estUsed * 0.2 * 100) / 100
       },
       {
-        partNum: `${cleanId}-t`,
+        partNum: `${cleanId}-hd`,
+        name: 'Cabeza Impresa',
+        category: 'head',
+        avgPriceEur: Math.round(estUsed * 0.15 * 100) / 100
+      },
+      {
+        partNum: `${cleanId}-tr`,
         name: 'Torso Impreso',
         category: 'torso',
-        avgPriceEur: Math.round(estUsed * 0.41 * 100) / 100
+        avgPriceEur: Math.round(estUsed * 0.4 * 100) / 100
       },
       {
-        partNum: `${cleanId}-l`,
-        name: 'Piernas',
+        partNum: `${cleanId}-lg`,
+        name: 'Piernas / Cadera',
         category: 'legs',
         avgPriceEur: Math.round(estUsed * 0.25 * 100) / 100
       }
     ],
+    partsSource: 'template',
     baseMarketPriceEur: {
       new: estNew,
       used_complete: estUsed,

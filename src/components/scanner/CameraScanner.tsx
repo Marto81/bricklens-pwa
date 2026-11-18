@@ -8,9 +8,11 @@ import {
   FolderPlus,
   Grid,
   ImagePlus,
+  Loader2,
   Minus,
   MoreVertical,
   Plus,
+  Puzzle,
   QrCode,
   RotateCcw,
   Search,
@@ -19,11 +21,15 @@ import {
 } from 'lucide-react';
 import type {
   BulkImportParsedLine,
+  BulkScanDetectedItem,
   BulkScanSession,
   CmfLookupResult,
   MinifigCondition,
   MinifigureMetadata,
+  NormalizedBoundingBox,
+  PartRecognitionResult,
   PreferredPriceSource,
+  PriceComparisonReport,
   RecognitionCandidate,
   RecognitionResult,
   ScannerMode,
@@ -36,21 +42,32 @@ import {
   MINIFIG_CATALOG
 } from '../../data/catalogPresets';
 import { lookupCmfCode, SAMPLE_CMF_PRESETS } from '../../data/cmfCodes';
-import { getQuickDualPricesEur } from '../../services/priceAggregator';
+import {
+  allocateLotPurchasePrices,
+  getQuickDualPricesEur
+} from '../../services/priceAggregator';
 import {
   encodeFullFrameToJpeg,
   identifyBulkLotFromImage,
   identifyMinifigureFromImage,
+  identifyPartFromImage,
+  identifySingleBulkBox,
   preprocessImageSourceToBlob
 } from '../../services/visionService';
+import { PriceAverageCard } from '../shared/PriceAverageCard';
+import { InteractiveBulkOverlay } from './InteractiveBulkOverlay';
+import { LotEvaluatorBar } from './LotEvaluatorBar';
+import { PartScannerPanel } from './PartScannerPanel';
 
 interface CameraScannerProps {
   preferredPriceSource: PreferredPriceSource;
+  defaultTargetMarginPct: number;
   collections: UserCollection[];
   activeCollectionId: string | null;
   onSelectCollection: (id: string) => void;
   onCreateCollection: (name: string) => Promise<UserCollection>;
   onSelectMinifigForComparison: (minifig: MinifigureMetadata, condition: MinifigCondition) => void;
+  onOpenMinifigDetail: (minifig: MinifigureMetadata, condition?: MinifigCondition) => void;
   onQuickAddToCollection: (
     minifig: MinifigureMetadata,
     condition: MinifigCondition,
@@ -71,11 +88,13 @@ interface BarcodeDetectorLike {
 
 export const CameraScanner: React.FC<CameraScannerProps> = ({
   preferredPriceSource,
+  defaultTargetMarginPct,
   collections,
   activeCollectionId,
   onSelectCollection,
   onCreateCollection,
   onSelectMinifigForComparison,
+  onOpenMinifigDetail,
   onQuickAddToCollection,
   onBulkAddToCollection
 }) => {
@@ -102,13 +121,23 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   const [selectedCandidateIdx, setSelectedCandidateIdx] = useState<number>(0);
   const [showAllCandidates, setShowAllCandidates] = useState<boolean>(false);
   const [selectedCondition, setSelectedCondition] = useState<MinifigCondition>('used_complete');
+  const [singlePriceReport, setSinglePriceReport] = useState<PriceComparisonReport | null>(null);
   const [customUnitValueInput, setCustomUnitValueInput] = useState<string>('');
+  const [userEditedUnitValue, setUserEditedUnitValue] = useState<boolean>(false);
   const [manualCodeInput, setManualCodeInput] = useState<string>('');
 
-  // Estado Modo Lote (Bulk)
+  // Estado Modo Pieza Suelta (Brickognize /predict/parts/ + cruce multi-pieza)
+  const [partScanResult, setPartScanResult] = useState<PartRecognitionResult | null>(null);
+
+  // Estado Modo Lote (Bulk interactivo + Evaluador Wallapop/Mercadillo)
   const [bulkSession, setBulkSession] = useState<BulkScanSession | null>(null);
   const [focusedBulkSlot, setFocusedBulkSlot] = useState<number>(1);
+  const [selectedBulkBoxId, setSelectedBulkBoxId] = useState<string | null>(null);
   const [expandedAltSlot, setExpandedAltSlot] = useState<number | null>(null);
+  const [lotAskingPrice, setLotAskingPrice] = useState<string>('');
+  const [lotShippingPrice, setLotShippingPrice] = useState<string>('');
+  const [lotTargetMarginPct, setLotTargetMarginPct] = useState<number>(defaultTargetMarginPct);
+  const [distributeLotCost, setDistributeLotCost] = useState<boolean>(true);
 
   // Estado Modo Cajas CMF
   const [cmfInput, setCmfInput] = useState<string>('');
@@ -121,6 +150,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   useEffect(() => {
     setTargetCollectionId(activeCollectionId);
   }, [activeCollectionId]);
+
+  useEffect(() => {
+    setLotTargetMarginPct(defaultTargetMarginPct);
+  }, [defaultTargetMarginPct]);
 
   // Vincula el MediaStream al <video> en cuanto el elemento se monte o active
   useEffect(() => {
@@ -266,6 +299,26 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     }
   };
 
+  const handleDemoPartCross = async () => {
+    stopCameraStream();
+    setIsScanning(true);
+    setCameraError(null);
+    try {
+      const result = await identifyPartFromImage({
+        previewDataUrl: '/samples/sw0585.jpg',
+        presetPart: {
+          partNum: '973pb1795c01',
+          name: 'Torso Armadura Imperial 2014 (Stormtrooper)',
+          category: 'torso',
+          imageUrl: '/samples/sw0585.jpg'
+        }
+      });
+      setPartScanResult(result);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
   const handleScanDemoBulkLot = async () => {
     stopCameraStream();
     setIsScanning(true);
@@ -286,6 +339,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       });
       setBulkSession(session);
       setFocusedBulkSlot(1);
+      setSelectedBulkBoxId(session.items[0]?.boxId ?? '1');
     } finally {
       setIsScanning(false);
     }
@@ -306,8 +360,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           });
           setBulkSession(session);
           setFocusedBulkSlot(1);
+          setSelectedBulkBoxId(session.items[0]?.boxId ?? null);
           setExpandedAltSlot(null);
           stopCameraStream();
+        } else if (scannerMode === 'part') {
+          const { blob, dataUrl } = await preprocessImageSourceToBlob(videoRef.current, 840);
+          stopCameraStream();
+          const result = await identifyPartFromImage({
+            blob,
+            previewDataUrl: dataUrl
+          });
+          setPartScanResult(result);
         } else {
           const { blob, dataUrl } = await preprocessImageSourceToBlob(videoRef.current, 840);
           stopCameraStream();
@@ -319,6 +382,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           setScanResult(result);
           setSelectedCandidateIdx(0);
           setShowAllCandidates(false);
+          setUserEditedUnitValue(false);
         }
       } catch (err) {
         stopCameraStream();
@@ -364,7 +428,15 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         });
         setBulkSession(session);
         setFocusedBulkSlot(1);
+        setSelectedBulkBoxId(session.items[0]?.boxId ?? null);
         setExpandedAltSlot(null);
+      } else if (scannerMode === 'part') {
+        const { blob, dataUrl } = await preprocessImageSourceToBlob(img, 840);
+        const result = await identifyPartFromImage({
+          blob,
+          previewDataUrl: dataUrl
+        });
+        setPartScanResult(result);
       } else {
         const { blob, dataUrl } = await preprocessImageSourceToBlob(img, 840);
         const result = await identifyMinifigureFromImage({
@@ -375,6 +447,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         setScanResult(result);
         setSelectedCandidateIdx(0);
         setShowAllCandidates(false);
+        setUserEditedUnitValue(false);
       }
     } catch (err) {
       setCameraError(
@@ -426,6 +499,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       ]
     });
     setSelectedCandidateIdx(0);
+    setUserEditedUnitValue(false);
     setManualCodeInput('');
   };
 
@@ -438,21 +512,34 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   }, [activeCandidate, preferredPriceSource]);
 
   const currentConditionPriceEur = useMemo(() => {
+    if (
+      singlePriceReport &&
+      activeCandidate &&
+      singlePriceReport.figId === activeCandidate.minifig.figId &&
+      singlePriceReport.condition === selectedCondition
+    ) {
+      return singlePriceReport.estimatedMarketValueEur;
+    }
     if (!singleDualPrices) return 0;
     return selectedCondition === 'new'
       ? singleDualPrices.newEur
       : selectedCondition === 'used_incomplete'
       ? singleDualPrices.incompleteEur
       : singleDualPrices.usedEur;
-  }, [singleDualPrices, selectedCondition]);
+  }, [singlePriceReport, activeCandidate, singleDualPrices, selectedCondition]);
 
   useEffect(() => {
+    setUserEditedUnitValue(false);
+  }, [activeCandidate?.minifig.figId, selectedCondition]);
+
+  useEffect(() => {
+    if (userEditedUnitValue) return;
     if (activeCandidate && currentConditionPriceEur > 0) {
       setCustomUnitValueInput(currentConditionPriceEur.toFixed(2));
     } else {
       setCustomUnitValueInput('');
     }
-  }, [activeCandidate?.minifig.figId, currentConditionPriceEur]);
+  }, [activeCandidate?.minifig.figId, currentConditionPriceEur, userEditedUnitValue]);
 
   const resolvedSingleUnitValueEur = useMemo(() => {
     const parsed = Number(customUnitValueInput.replace(',', '.'));
@@ -516,10 +603,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     showToast(`${qty}× ${minifig.figId.toUpperCase()} guardada en «${resolvedTargetCollectionName}»`);
   };
 
-  // Manipuladores de filas del Modo Lote (Bulk)
+  // Manipuladores de filas y editor interactivo del Modo Lote (Bulk)
   const updateBulkItem = (
     slotIndex: number,
-    updater: (item: BulkScanSession['items'][number]) => BulkScanSession['items'][number]
+    updater: (item: BulkScanDetectedItem) => BulkScanDetectedItem
   ) => {
     setBulkSession((prev) =>
       prev
@@ -529,6 +616,164 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           }
         : prev
     );
+  };
+
+  const handleSelectBulkBox = (boxId: string | null) => {
+    setSelectedBulkBoxId(boxId);
+    if (!boxId || !bulkSession) return;
+    const matched = bulkSession.items.find((it) => (it.boxId || String(it.slotIndex)) === boxId);
+    if (matched) {
+      setFocusedBulkSlot(matched.slotIndex);
+    }
+  };
+
+  const handleUpdateBulkBoxRect = (boxId: string, rect: NormalizedBoundingBox) => {
+    setBulkSession((prev) =>
+      prev
+        ? {
+            ...prev,
+            items: prev.items.map((it) =>
+              (it.boxId || String(it.slotIndex)) === boxId ? { ...it, boundingBox: rect } : it
+            )
+          }
+        : prev
+    );
+  };
+
+  const handleRescanBulkBox = async (boxId: string, rectOverride?: NormalizedBoundingBox) => {
+    if (!bulkSession) return;
+    const target = bulkSession.items.find((it) => (it.boxId || String(it.slotIndex)) === boxId);
+    if (!target) return;
+    const rectToScan = rectOverride ?? target.boundingBox;
+
+    setBulkSession((prev) =>
+      prev
+        ? {
+            ...prev,
+            items: prev.items.map((it) =>
+              (it.boxId || String(it.slotIndex)) === boxId
+                ? { ...it, boundingBox: rectToScan, status: 'scanning' }
+                : it
+            )
+          }
+        : prev
+    );
+
+    try {
+      const scanned = await identifySingleBulkBox({
+        sourceImageUrl: bulkSession.sourceImageDataUrl,
+        boundingBox: rectToScan,
+        slotIndex: target.slotIndex,
+        boxId: target.boxId || boxId
+      });
+
+      setBulkSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              items: prev.items.map((it) =>
+                (it.boxId || String(it.slotIndex)) === boxId
+                  ? {
+                      ...scanned,
+                      condition: it.condition,
+                      quantity: it.quantity
+                    }
+                  : it
+              )
+            }
+          : prev
+      );
+    } catch {
+      setBulkSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              items: prev.items.map((it) =>
+                (it.boxId || String(it.slotIndex)) === boxId ? { ...it, status: 'error' } : it
+              )
+            }
+          : prev
+      );
+    }
+  };
+
+  const handleAddBulkBoxAtRect = async (rect: NormalizedBoundingBox) => {
+    if (!bulkSession) return;
+    const nextSlot =
+      bulkSession.items.reduce((max, it) => Math.max(max, it.slotIndex), 0) + 1;
+    const newBoxId = `box-${Date.now()}-${nextSlot}`;
+    const placeholderFig = createCustomMinifigMetadata({
+      figId: `lote-${nextSlot}`,
+      name: `Analizando figura #${nextSlot}…`,
+      imageUrl: bulkSession.sourceImageDataUrl
+    });
+
+    const pendingItem: BulkScanDetectedItem = {
+      boxId: newBoxId,
+      slotIndex: nextSlot,
+      boundingBox: rect,
+      cropDataUrl: bulkSession.sourceImageDataUrl,
+      selectedMinifig: placeholderFig,
+      candidates: [],
+      condition: 'used_complete',
+      quantity: 1,
+      included: false,
+      status: 'scanning'
+    };
+
+    setBulkSession((prev) =>
+      prev
+        ? {
+            ...prev,
+            items: [...prev.items, pendingItem]
+          }
+        : prev
+    );
+    setSelectedBulkBoxId(newBoxId);
+    setFocusedBulkSlot(nextSlot);
+
+    try {
+      const scanned = await identifySingleBulkBox({
+        sourceImageUrl: bulkSession.sourceImageDataUrl,
+        boundingBox: rect,
+        slotIndex: nextSlot,
+        boxId: newBoxId
+      });
+      setBulkSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              items: prev.items.map((it) => (it.boxId === newBoxId ? scanned : it))
+            }
+          : prev
+      );
+    } catch {
+      setBulkSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              items: prev.items.map((it) =>
+                it.boxId === newBoxId ? { ...it, status: 'error' } : it
+              )
+            }
+          : prev
+      );
+    }
+  };
+
+  const handleDeleteBulkBox = (boxId: string) => {
+    setBulkSession((prev) => {
+      if (!prev) return prev;
+      const remaining = prev.items
+        .filter((it) => (it.boxId || String(it.slotIndex)) !== boxId)
+        .map((it, idx) => ({ ...it, slotIndex: idx + 1 }));
+      return {
+        ...prev,
+        items: remaining
+      };
+    });
+    setSelectedBulkBoxId(null);
+    setExpandedAltSlot(null);
   };
 
   const setAllBulkCondition = (cond: MinifigCondition) => {
@@ -548,7 +793,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     let totalUnits = 0;
     let totalValueEur = 0;
     for (const item of bulkSession.items) {
-      if (!item.included) continue;
+      if (!item.included || item.status === 'scanning') continue;
       activeCount++;
       totalUnits += item.quantity;
       const dual = getQuickDualPricesEur(item.selectedMinifig, preferredPriceSource);
@@ -569,8 +814,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
 
   const handleBulkCommitAll = () => {
     if (!bulkSession) return;
-    const lines: BulkImportParsedLine[] = bulkSession.items
-      .filter((it) => it.included && it.quantity > 0)
+    const rawLines: BulkImportParsedLine[] = bulkSession.items
+      .filter((it) => it.included && it.quantity > 0 && it.status !== 'scanning')
       .map((it) => {
         const dual = getQuickDualPricesEur(it.selectedMinifig, preferredPriceSource);
         const unitVal =
@@ -590,9 +835,28 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         };
       });
 
-    if (lines.length === 0) return;
-    onBulkAddToCollection(lines, targetCollectionId);
-    showToast(`${bulkSummary.totalUnits} uds. guardadas en «${resolvedTargetCollectionName}»`);
+    if (rawLines.length === 0) return;
+
+    const askingNum = Number(lotAskingPrice.replace(',', '.')) || 0;
+    const shippingNum = Number(lotShippingPrice.replace(',', '.')) || 0;
+    const totalLotPaid = Math.round((askingNum + shippingNum) * 100) / 100;
+
+    let finalLines = rawLines;
+    if (distributeLotCost && askingNum > 0 && totalLotPaid > 0) {
+      const allocatedUnitCosts = allocateLotPurchasePrices(rawLines, totalLotPaid);
+      finalLines = rawLines.map((line, idx) => ({
+        ...line,
+        purchasePriceEur: allocatedUnitCosts[idx] ?? line.purchasePriceEur,
+        notes: `Lote (${totalLotPaid.toFixed(2)} € repartidos proporcionalmente)`
+      }));
+    }
+
+    onBulkAddToCollection(finalLines, targetCollectionId);
+    showToast(
+      distributeLotCost && askingNum > 0
+        ? `${bulkSummary.totalUnits} uds. guardadas (${totalLotPaid.toFixed(2)} € repartidos)`
+        : `${bulkSummary.totalUnits} uds. guardadas en «${resolvedTargetCollectionName}»`
+    );
   };
 
   const handleCmfSearch = (raw?: string) => {
@@ -677,24 +941,35 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     return 'Error de conexión';
   }, [cameraActive, scanResult]);
 
+  const partHudLabel = useMemo(() => {
+    if (cameraActive) return 'Cámara en vivo · Enfoca la pieza';
+    if (!partScanResult) return 'Brickognize Piezas · Listo';
+    if (partScanResult.apiSource === 'brickognize_live') {
+      return `Piezas · ${partScanResult.candidates.length} candidatas`;
+    }
+    if (partScanResult.apiSource === 'demo_preset') return 'Pieza de ejemplo';
+    if (partScanResult.apiSource === 'no_match') return 'Pieza no reconocida';
+    return 'Error de conexión';
+  }, [cameraActive, partScanResult]);
+
   const bulkHudLabel = useMemo(() => {
     if (cameraActive) return 'Cámara en vivo · Encuadra el lote';
     if (!bulkSession) return 'Escáner de Lote · Listo';
     if (bulkSession.apiSource === 'brickognize_live') {
-      return `Bulk · ${bulkSession.items.length} detectadas (En Vivo)`;
+      return `Lote · ${bulkSession.items.length} recuadros`;
     }
     if (bulkSession.apiSource === 'demo_preset') {
       return `Lote demo · ${bulkSession.items.length} figs`;
     }
-    if (bulkSession.apiSource === 'no_match') return 'Sin figuras detectadas';
+    if (bulkSession.apiSource === 'no_match') return 'Añade recuadros sobre la foto';
     return 'Error en escaneo de lote';
   }, [cameraActive, bulkSession]);
 
   return (
     <section className="screen-stack" aria-label="Escáner óptico de minifiguras LEGO">
-      {/* Conmutador Sutil de 3 Modos + Visor */}
+      {/* Conmutador Sutil de 4 Modos + Visor */}
       <div className="surface-card viewfinder-shell">
-        <div className="mode-pill-bar" role="tablist" aria-label="Modo de escáner">
+        <div className="mode-pill-bar four-cols" role="tablist" aria-label="Modo de escáner">
           <button
             type="button"
             id="mode-tab-single"
@@ -708,6 +983,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           </button>
           <button
             type="button"
+            id="mode-tab-part"
+            role="tab"
+            aria-selected={scannerMode === 'part'}
+            className={`mode-pill-btn ${scannerMode === 'part' ? 'active' : ''}`}
+            onClick={() => switchMode('part')}
+          >
+            <Puzzle size={13} />
+            <span>Pieza</span>
+          </button>
+          <button
+            type="button"
             id="mode-tab-bulk"
             role="tab"
             aria-selected={scannerMode === 'bulk'}
@@ -715,7 +1001,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             onClick={() => switchMode('bulk')}
           >
             <Grid size={13} />
-            <span>Lote (Bulk)</span>
+            <span>Lote</span>
           </button>
           <button
             type="button"
@@ -726,7 +1012,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             onClick={() => switchMode('cmf')}
           >
             <QrCode size={13} />
-            <span>Cajas CMF</span>
+            <span>CMF</span>
           </button>
         </div>
 
@@ -892,7 +1178,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                         onSelectMinifigForComparison(cmfResult.minifig!, cmfCondition)
                       }
                     >
-                      5 Portales
+                      Tasar
                     </button>
                     <button
                       type="button"
@@ -927,119 +1213,144 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             )}
           </div>
         ) : (
-          /* MODOS INDIVIDUAL Y LOTE (VISOR ÓPTICO + BARRA DE CÁMARA) */
+          /* MODOS INDIVIDUAL, PIEZA SUELTA Y LOTE INTERACTIVO */
           <>
-            <div
-              className={`viewfinder-stage ${scannerMode === 'bulk' ? 'bulk-mode' : ''} ${
-                isDragging ? 'drag-over' : ''
-              }`}
-              style={
-                scannerMode === 'bulk' && !cameraActive && bulkSession?.aspectRatio
-                  ? { aspectRatio: String(bulkSession.aspectRatio), maxHeight: 380 }
-                  : undefined
-              }
-              onDragOver={(e) => {
-                e.preventDefault();
-                setIsDragging(true);
-              }}
-              onDragLeave={() => setIsDragging(false)}
-              onDrop={handleDropOnViewfinder}
-            >
-              {cameraActive ? (
-                <video ref={videoRef} className="viewfinder-media" playsInline muted autoPlay />
-              ) : scannerMode === 'bulk' && bulkSession ? (
-                <img
-                  src={bulkSession.sourceImageDataUrl}
-                  alt="Lote múltiple de minifiguras LEGO"
-                  className={`viewfinder-media ${isScanning ? 'scanning' : ''}`}
-                  style={{ objectFit: 'contain' }}
-                />
-              ) : scannerMode === 'single' && scanResult?.processedImageDataUrl ? (
-                <img
-                  src={scanResult.processedImageDataUrl}
-                  alt={activeCandidate?.minifig.name || 'Captura de minifigura'}
-                  className={`viewfinder-media ${isScanning ? 'scanning' : ''}`}
-                  style={{ objectFit: 'contain' }}
-                />
-              ) : (
-                <div className="scanner-empty-stage">
-                  <div className="scanner-empty-icon">
-                    {scannerMode === 'bulk' ? <Grid size={26} /> : <Camera size={26} />}
-                  </div>
-                  <strong>
-                    {scannerMode === 'bulk'
-                      ? 'Escanea un lote sobre fondo liso'
-                      : 'Fotografía o sube 1 minifigura'}
-                  </strong>
-                  <span>
-                    {scannerMode === 'bulk'
-                      ? 'Separa ligeramente las figuras sobre una mesa clara y pulsa el disparador.'
-                      : 'Encuadra de pies a cabeza con buena luz. Identificación real vía Brickognize.'}
-                  </span>
+            {scannerMode === 'bulk' && !cameraActive && bulkSession && !isScanning ? (
+              <div className="bulk-interactive-stage-shell">
+                <div className="bulk-stage-status-bar">
+                  <span className="hud-pill">{bulkHudLabel}</span>
+                  {bulkSession.latencyMs ? (
+                    <span className="hud-pill latency" id="scanner-latency-badge">
+                      <Zap size={11} /> {bulkSession.latencyMs} ms
+                    </span>
+                  ) : null}
                 </div>
-              )}
-
-              {/* HUD Minimalista */}
-              <div className="hud-top">
-                <span className="hud-pill">
-                  {scannerMode === 'bulk' ? bulkHudLabel : singleHudLabel}
-                </span>
-                {(scannerMode === 'bulk' ? bulkSession?.latencyMs : scanResult?.latencyMs) ? (
-                  <span className="hud-pill latency" id="scanner-latency-badge">
-                    <Zap size={11} />{' '}
-                    {scannerMode === 'bulk' ? bulkSession?.latencyMs : scanResult?.latencyMs} ms
-                  </span>
-                ) : null}
+                <InteractiveBulkOverlay
+                  imageUrl={bulkSession.sourceImageDataUrl}
+                  aspectRatio={bulkSession.aspectRatio}
+                  items={bulkSession.items}
+                  selectedBoxId={selectedBulkBoxId}
+                  onSelectBox={handleSelectBulkBox}
+                  onUpdateBoxRect={handleUpdateBulkBoxRect}
+                  onCommitBoxRect={(boxId, rect) => void handleRescanBulkBox(boxId, rect)}
+                  onAddBoxAtRect={(rect) => void handleAddBulkBoxAtRect(rect)}
+                  onDeleteBox={handleDeleteBulkBox}
+                  onRescanBox={(boxId) => void handleRescanBulkBox(boxId)}
+                />
               </div>
-
-              {/* Recuadros numerados en Modo Bulk */}
-              {scannerMode === 'bulk' &&
-                !cameraActive &&
-                bulkSession &&
-                bulkSession.items.length > 0 &&
-                !isScanning && (
-                  <div className="bulk-overlay-layer" aria-label="Figuras detectadas en la imagen">
-                    {bulkSession.items.map((item) => {
-                      const isFocused = focusedBulkSlot === item.slotIndex;
-                      return (
-                        <button
-                          key={item.slotIndex}
-                          type="button"
-                          id={`bulk-bbox-${item.slotIndex}`}
-                          className={`bulk-bbox-overlay ${isFocused ? 'active' : ''}`}
-                          style={{
-                            left: `${item.boundingBox.x * 100}%`,
-                            top: `${item.boundingBox.y * 100}%`,
-                            width: `${item.boundingBox.width * 100}%`,
-                            height: `${item.boundingBox.height * 100}%`
-                          }}
-                          onClick={() => setFocusedBulkSlot(item.slotIndex)}
-                          title={`#${item.slotIndex} ${item.selectedMinifig.figId}`}
-                        >
-                          <span className="bulk-bbox-tag">{item.slotIndex}</span>
-                        </button>
-                      );
-                    })}
+            ) : (
+              <div
+                className={`viewfinder-stage ${scannerMode === 'bulk' ? 'bulk-mode' : ''} ${
+                  isDragging ? 'drag-over' : ''
+                }`}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setIsDragging(true);
+                }}
+                onDragLeave={() => setIsDragging(false)}
+                onDrop={handleDropOnViewfinder}
+              >
+                {cameraActive ? (
+                  <video ref={videoRef} className="viewfinder-media" playsInline muted autoPlay />
+                ) : scannerMode === 'part' && partScanResult?.processedImageDataUrl ? (
+                  <img
+                    src={partScanResult.processedImageDataUrl}
+                    alt="Captura de pieza LEGO"
+                    className={`viewfinder-media ${isScanning ? 'scanning' : ''}`}
+                    style={{ objectFit: 'contain' }}
+                  />
+                ) : scannerMode === 'single' && scanResult?.processedImageDataUrl ? (
+                  <img
+                    src={scanResult.processedImageDataUrl}
+                    alt={activeCandidate?.minifig.name || 'Captura de minifigura'}
+                    className={`viewfinder-media ${isScanning ? 'scanning' : ''}`}
+                    style={{ objectFit: 'contain' }}
+                  />
+                ) : (
+                  <div className="scanner-empty-stage">
+                    <div className="scanner-empty-icon">
+                      {scannerMode === 'bulk' ? (
+                        <Grid size={26} />
+                      ) : scannerMode === 'part' ? (
+                        <Puzzle size={26} />
+                      ) : (
+                        <Camera size={26} />
+                      )}
+                    </div>
+                    <strong>
+                      {scannerMode === 'bulk'
+                        ? 'Escanea un lote sobre fondo liso'
+                        : scannerMode === 'part'
+                        ? 'Fotografía una pieza suelta'
+                        : 'Fotografía o sube 1 minifigura'}
+                    </strong>
+                    <span>
+                      {scannerMode === 'bulk'
+                        ? 'Separa ligeramente las figuras sobre una mesa clara y ajusta o dibuja recuadros sobre la foto.'
+                        : scannerMode === 'part'
+                        ? 'Torso, casco, cabeza o piernas sobre fondo liso. Cruzamos la pieza para hallar su minifigura.'
+                        : 'Encuadra de pies a cabeza con buena luz. Identificación real vía Brickognize.'}
+                    </span>
                   </div>
                 )}
 
-              {scannerMode === 'single' && (
-                <div className={`reticle-frame ${isScanning ? 'scanning' : ''}`} aria-hidden="true">
-                  <div className="reticle-corner tl" />
-                  <div className="reticle-corner tr" />
-                  <div className="reticle-corner bl" />
-                  <div className="reticle-corner br" />
-                  {isScanning && <div className="laser-sweep" />}
+                {/* HUD Minimalista */}
+                <div className="hud-top">
+                  <span className="hud-pill">
+                    {scannerMode === 'bulk'
+                      ? bulkHudLabel
+                      : scannerMode === 'part'
+                      ? partHudLabel
+                      : singleHudLabel}
+                  </span>
+                  {(scannerMode === 'bulk'
+                    ? bulkSession?.latencyMs
+                    : scannerMode === 'part'
+                    ? partScanResult?.latencyMs
+                    : scanResult?.latencyMs) ? (
+                    <span className="hud-pill latency" id="scanner-latency-badge">
+                      <Zap size={11} />{' '}
+                      {scannerMode === 'bulk'
+                        ? bulkSession?.latencyMs
+                        : scannerMode === 'part'
+                        ? partScanResult?.latencyMs
+                        : scanResult?.latencyMs}{' '}
+                      ms
+                    </span>
+                  ) : null}
                 </div>
-              )}
 
-              {scannerMode === 'single' && activeCandidate && !isScanning && (
-                <div className="hud-match-badge">
-                  <strong>{activeCandidate.minifig.figId.toUpperCase()}</strong>
-                  <span>{Math.round(activeCandidate.confidence * 100)}% match</span>
-                </div>
-              )}
-            </div>
+                {(scannerMode === 'single' || scannerMode === 'part') && (
+                  <div
+                    className={`reticle-frame ${isScanning ? 'scanning' : ''}`}
+                    aria-hidden="true"
+                  >
+                    <div className="reticle-corner tl" />
+                    <div className="reticle-corner tr" />
+                    <div className="reticle-corner bl" />
+                    <div className="reticle-corner br" />
+                    {isScanning && <div className="laser-sweep" />}
+                  </div>
+                )}
+
+                {scannerMode === 'single' && activeCandidate && !isScanning && (
+                  <div className="hud-match-badge">
+                    <strong>{activeCandidate.minifig.figId.toUpperCase()}</strong>
+                    <span>{Math.round(activeCandidate.confidence * 100)}% match</span>
+                  </div>
+                )}
+
+                {scannerMode === 'part' &&
+                  partScanResult &&
+                  partScanResult.candidates.length > 0 &&
+                  !isScanning && (
+                    <div className="hud-match-badge">
+                      <strong>{partScanResult.candidates[0].partNum}</strong>
+                      <span>{Math.round(partScanResult.candidates[0].confidence * 100)}%</span>
+                    </div>
+                  )}
+              </div>
+            )}
 
             {cameraError && <p className="camera-notice">{cameraError}</p>}
 
@@ -1067,6 +1378,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                     ? 'Capturar y analizar'
                     : scannerMode === 'bulk'
                     ? 'Hacer foto de lote con cámara'
+                    : scannerMode === 'part'
+                    ? 'Hacer foto de pieza suelta con cámara'
                     : 'Hacer foto de minifigura con cámara'
                 }
                 title={
@@ -1150,10 +1463,24 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                     </div>
                   )}
                 </>
+              ) : scannerMode === 'part' ? (
+                <div className="demo-optin-row">
+                  <span className="section-hint">
+                    Escanea un torso y luego añade casco o piernas para acotar la minifigura.
+                  </span>
+                  <button
+                    type="button"
+                    id="btn-demo-part-top"
+                    className="link-btn-mini"
+                    onClick={() => void handleDemoPartCross()}
+                  >
+                    Probar torso
+                  </button>
+                </div>
               ) : (
                 <div className="demo-optin-row">
                   <span className="section-hint">
-                    Foto de mesa/lote sobre superficie clara para detectar varias figuras.
+                    Foto de mesa/lote; podrás mover, redimensionar o añadir recuadros.
                   </span>
                   <button
                     type="button"
@@ -1226,6 +1553,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           </div>
         )}
 
+      {/* PANEL DE MODO PIEZA SUELTA (Cruce de piezas + Minifiguras compatibles) */}
+      {scannerMode === 'part' && (
+        <PartScannerPanel
+          partResult={partScanResult}
+          isScanning={isScanning}
+          preferredPriceSource={preferredPriceSource}
+          onTriggerDemoPartCross={() => void handleDemoPartCross()}
+          onOpenMinifigDetail={(fig) => onOpenMinifigDetail(fig, 'used_complete')}
+        />
+      )}
+
       {/* DIAGNÓSTICO MODO LOTE (Bulk vacío o con error) */}
       {scannerMode === 'bulk' &&
         bulkSession &&
@@ -1238,11 +1576,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                 <h2 className="fig-title-lg" style={{ fontSize: '0.96rem', marginTop: 0 }}>
                   {bulkSession.apiSource === 'error'
                     ? 'Error al analizar el lote'
-                    : 'No se identificaron minifiguras en la imagen'}
+                    : 'No se detectaron figuras automáticamente'}
                 </h2>
                 <p className="section-hint" style={{ marginTop: 3 }}>
                   {bulkSession.errorMessage ||
-                    'Coloca las minifiguras separadas entre sí sobre una mesa o papel claro y vuelve a intentarlo.'}
+                    'Puedes pulsar «Añadir recuadro» sobre la foto de arriba para marcar manualmente cada figura, o hacer otra foto sobre fondo claro.'}
                 </p>
               </div>
             </div>
@@ -1267,7 +1605,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           </div>
         )}
 
-      {/* PANEL DE RESULTADO: MODO LOTE (Estilo brick'em) */}
+      {/* PANEL DE RESULTADO: MODO LOTE (Estilo brick'em + Evaluador Wallapop) */}
       {scannerMode === 'bulk' && bulkSession && bulkSession.items.length > 0 && (
         <div className="surface-card" id="bulk-result-panel">
           <div className="bulk-summary-bar">
@@ -1304,22 +1642,29 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
 
           <div className="brickem-row-list" role="list">
             {bulkSession.items.map((item) => {
+              const boxId = item.boxId || String(item.slotIndex);
               const dual = getQuickDualPricesEur(item.selectedMinifig, preferredPriceSource);
-              const isFocused = focusedBulkSlot === item.slotIndex;
+              const isFocused = focusedBulkSlot === item.slotIndex || selectedBulkBoxId === boxId;
               const isAltOpen = expandedAltSlot === item.slotIndex;
+              const isRowScanning = item.status === 'scanning';
 
               return (
                 <div
-                  key={item.slotIndex}
+                  key={boxId}
                   id={`bulk-row-${item.slotIndex}`}
                   className={`brickem-row ${isFocused ? 'focused' : ''}`}
-                  style={{ opacity: item.included ? 1 : 0.45 }}
+                  style={{ opacity: item.included || isRowScanning ? 1 : 0.5 }}
                 >
                   <div
                     className="brickem-row-main"
-                    onClick={() => setFocusedBulkSlot(item.slotIndex)}
+                    onClick={() => {
+                      setFocusedBulkSlot(item.slotIndex);
+                      setSelectedBulkBoxId(boxId);
+                    }}
                   >
-                    <span className="brickem-slot-num">{item.slotIndex}</span>
+                    <span className="brickem-slot-num">
+                      {isRowScanning ? <Loader2 size={11} className="spin" /> : item.slotIndex}
+                    </span>
                     <img
                       src={item.cropDataUrl || item.selectedMinifig.imageUrl}
                       alt={item.selectedMinifig.name}
@@ -1334,100 +1679,120 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                         >
                           {item.selectedMinifig.figId.toUpperCase()}
                         </span>
-                        <div className="brickem-dual-prices">
-                          <span className="used">Usada {dual.usedEur.toFixed(2)} €</span>
-                          <span className="new">Nueva {dual.newEur.toFixed(2)} €</span>
-                        </div>
+                        {isRowScanning ? (
+                          <span className="section-hint">Analizando recuadro…</span>
+                        ) : item.status === 'no_match' || item.status === 'error' ? (
+                          <span className="section-hint">Ajusta el recuadro y re-escanea</span>
+                        ) : (
+                          <div className="brickem-dual-prices">
+                            <span className="used">Usada {dual.usedEur.toFixed(2)} €</span>
+                            <span className="new">Nueva {dual.newEur.toFixed(2)} €</span>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
 
-                  <div className="brickem-row-actions">
-                    <div className="brickem-cond-mini">
-                      <button
-                        type="button"
-                        className={item.condition !== 'new' ? 'active' : ''}
-                        onClick={() =>
-                          updateBulkItem(item.slotIndex, (cur) => ({
-                            ...cur,
-                            condition: 'used_complete'
-                          }))
-                        }
-                      >
-                        Usada
-                      </button>
-                      <button
-                        type="button"
-                        className={item.condition === 'new' ? 'active' : ''}
-                        onClick={() =>
-                          updateBulkItem(item.slotIndex, (cur) => ({ ...cur, condition: 'new' }))
-                        }
-                      >
-                        Nueva
-                      </button>
-                    </div>
+                  {!isRowScanning && (
+                    <div className="brickem-row-actions">
+                      <div className="brickem-cond-mini">
+                        <button
+                          type="button"
+                          className={item.condition !== 'new' ? 'active' : ''}
+                          onClick={() =>
+                            updateBulkItem(item.slotIndex, (cur) => ({
+                              ...cur,
+                              condition: 'used_complete'
+                            }))
+                          }
+                        >
+                          Usada
+                        </button>
+                        <button
+                          type="button"
+                          className={item.condition === 'new' ? 'active' : ''}
+                          onClick={() =>
+                            updateBulkItem(item.slotIndex, (cur) => ({ ...cur, condition: 'new' }))
+                          }
+                        >
+                          Nueva
+                        </button>
+                      </div>
 
-                    <div className="qty-stepper" aria-label={`Cantidad ítem ${item.slotIndex}`}>
-                      <button
-                        type="button"
-                        className="stepper-btn"
-                        onClick={() =>
-                          updateBulkItem(item.slotIndex, (cur) =>
-                            cur.quantity <= 1
-                              ? { ...cur, included: false }
-                              : { ...cur, quantity: cur.quantity - 1 }
-                          )
-                        }
-                        aria-label="Reducir"
-                      >
-                        <Minus size={12} />
-                      </button>
-                      <span className="qty-val" style={{ fontSize: '0.74rem' }}>
-                        {item.included ? item.quantity : 0}
-                      </span>
-                      <button
-                        type="button"
-                        className="stepper-btn"
-                        onClick={() =>
-                          updateBulkItem(item.slotIndex, (cur) => ({
-                            ...cur,
-                            included: true,
-                            quantity: cur.included ? cur.quantity + 1 : 1
-                          }))
-                        }
-                        aria-label="Aumentar"
-                      >
-                        <Plus size={12} />
-                      </button>
-                    </div>
+                      <div className="qty-stepper" aria-label={`Cantidad ítem ${item.slotIndex}`}>
+                        <button
+                          type="button"
+                          className="stepper-btn"
+                          onClick={() =>
+                            updateBulkItem(item.slotIndex, (cur) =>
+                              cur.quantity <= 1
+                                ? { ...cur, included: false }
+                                : { ...cur, quantity: cur.quantity - 1 }
+                            )
+                          }
+                          aria-label="Reducir"
+                        >
+                          <Minus size={12} />
+                        </button>
+                        <span className="qty-val" style={{ fontSize: '0.74rem' }}>
+                          {item.included ? item.quantity : 0}
+                        </span>
+                        <button
+                          type="button"
+                          className="stepper-btn"
+                          onClick={() =>
+                            updateBulkItem(item.slotIndex, (cur) => ({
+                              ...cur,
+                              included: true,
+                              quantity: cur.included ? cur.quantity + 1 : 1
+                            }))
+                          }
+                          aria-label="Aumentar"
+                        >
+                          <Plus size={12} />
+                        </button>
+                      </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                      <button
-                        type="button"
-                        id={`btn-bulk-alt-${item.slotIndex}`}
-                        className={`btn-chip ${isAltOpen ? 'active' : ''}`}
-                        style={{ padding: '4px 7px', fontSize: '0.7rem' }}
-                        onClick={() =>
-                          setExpandedAltSlot(isAltOpen ? null : item.slotIndex)
-                        }
-                        title="Cambiar entre alternativas"
-                      >
-                        <MoreVertical size={12} />
-                        <span>{item.candidates.length} alt.</span>
-                      </button>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <button
+                          type="button"
+                          className="btn-chip"
+                          style={{ padding: '4px 7px', fontSize: '0.7rem' }}
+                          onClick={() => onOpenMinifigDetail(item.selectedMinifig, item.condition)}
+                          title="Abrir despiece y detalle"
+                        >
+                          <Puzzle size={12} />
+                        </button>
 
-                      <button
-                        type="button"
-                        className="btn-chip"
-                        style={{ padding: '4px 8px', fontSize: '0.7rem' }}
-                        onClick={() =>
-                          handleQuickAdd(item.selectedMinifig, item.condition, item.quantity)
-                        }
-                      >
-                        + Añadir
-                      </button>
+                        {item.candidates.length > 0 && (
+                          <button
+                            type="button"
+                            id={`btn-bulk-alt-${item.slotIndex}`}
+                            className={`btn-chip ${isAltOpen ? 'active' : ''}`}
+                            style={{ padding: '4px 7px', fontSize: '0.7rem' }}
+                            onClick={() =>
+                              setExpandedAltSlot(isAltOpen ? null : item.slotIndex)
+                            }
+                            title="Cambiar entre alternativas"
+                          >
+                            <MoreVertical size={12} />
+                            <span>{item.candidates.length} alt.</span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          className="btn-chip"
+                          style={{ padding: '4px 8px', fontSize: '0.7rem' }}
+                          onClick={() =>
+                            handleQuickAdd(item.selectedMinifig, item.condition, item.quantity)
+                          }
+                        >
+                          + Añadir
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  )}
 
                   {isAltOpen && (
                     <div className="brickem-alt-drawer" id={`bulk-alt-drawer-${item.slotIndex}`}>
@@ -1464,6 +1829,22 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                 </div>
               );
             })}
+          </div>
+
+          {/* Evaluador de Lotes Wallapop / Vinted / Mercadillo */}
+          <div style={{ marginTop: 14 }}>
+            <LotEvaluatorBar
+              totalMarketValueEur={bulkSummary.totalValueEur}
+              selectedUnitsCount={bulkSummary.totalUnits}
+              askingPriceInput={lotAskingPrice}
+              shippingInput={lotShippingPrice}
+              targetMarginPct={lotTargetMarginPct}
+              distributeCostProportionally={distributeLotCost}
+              onChangeAskingPrice={setLotAskingPrice}
+              onChangeShipping={setLotShippingPrice}
+              onChangeTargetMargin={setLotTargetMarginPct}
+              onToggleDistributeCost={setDistributeLotCost}
+            />
           </div>
 
           <div style={{ marginTop: 12 }}>{renderTargetCollectionSelector('bulk')}</div>
@@ -1506,7 +1887,9 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               <div className="fig-meta-line">
                 <span className="code-chip">{activeCandidate.minifig.figId.toUpperCase()}</span>
                 <span>{activeCandidate.minifig.theme}</span>
-                <span>· {activeCandidate.minifig.yearReleased}</span>
+                {activeCandidate.minifig.yearReleased > 0 && (
+                  <span>· {activeCandidate.minifig.yearReleased}</span>
+                )}
                 <span>· {activeCandidate.minifig.sampleSetCode}</span>
               </div>
             </div>
@@ -1558,16 +1941,27 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             </div>
           </div>
 
-          {/* Ajuste de precio cuando la figura no tiene precio local guardado */}
+          {/* Media de mercado + desglose desplegable en 1 toque (5 portales) */}
+          <div className="sheet-section">
+            <PriceAverageCard
+              minifig={activeCandidate.minifig}
+              condition={selectedCondition}
+              preferredPriceSource={preferredPriceSource}
+              compact
+              onReportChange={setSinglePriceReport}
+            />
+          </div>
+
+          {/* Ajuste rápido de precio antes de guardar */}
           <div className="sheet-section">
             <div className="price-override-row">
               <div>
                 <label htmlFor="scanner-unit-value-input" className="eyebrow">
-                  Valor estimado (€)
+                  Valor a guardar (€)
                 </label>
                 {activeCandidate.minifig.isEstimatedFallbackPrice && (
                   <p className="section-hint" style={{ fontSize: '0.7rem' }}>
-                    Precio base orientativo. Consulta los 5 portales o ajústalo antes de guardar.
+                    Precio orientativo. Abre el desglose de portales o ajústalo aquí.
                   </p>
                 )}
               </div>
@@ -1578,7 +1972,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                 min={0.5}
                 className="field-input mono price-override-input"
                 value={customUnitValueInput}
-                onChange={(e) => setCustomUnitValueInput(e.target.value)}
+                onChange={(e) => {
+                  setUserEditedUnitValue(true);
+                  setCustomUnitValueInput(e.target.value);
+                }}
               />
             </div>
           </div>
@@ -1649,6 +2046,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
             </div>
           )}
 
+          <button
+            type="button"
+            id="btn-scanner-open-detail"
+            className="btn-tonal btn-full"
+            style={{ marginTop: 10 }}
+            onClick={() => onOpenMinifigDetail(activeCandidate.minifig, selectedCondition)}
+          >
+            <Puzzle size={15} />
+            <span>Ver despiece interactivo y faltantes</span>
+          </button>
+
           <div className="action-pair">
             <button
               type="button"
@@ -1670,7 +2078,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               }}
             >
               <Search size={16} />
-              <span>Comparar 5 Portales</span>
+              <span>Abrir Tasador</span>
               <ChevronRight size={15} />
             </button>
 

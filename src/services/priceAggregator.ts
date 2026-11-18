@@ -1,11 +1,17 @@
 import type {
   BulkImportParsedLine,
+  LivePortalQuoteSnapshot,
+  LotDealEvaluation,
+  LotDealVerdict,
   MarketplaceId,
   MarketplaceQuote,
   MinifigCondition,
+  MinifigPartBreakdown,
   MinifigureMetadata,
+  MissingPartsValuationSummary,
   PreferredPriceSource,
-  PriceComparisonReport
+  PriceComparisonReport,
+  QuoteDataSource
 } from '../types/minifig';
 import {
   ALL_MINIFIG_CATALOG,
@@ -31,17 +37,17 @@ export const PREFERRED_PRICE_SOURCE_LABELS: Record<PreferredPriceSource, string>
   weighted: 'Media Ponderada (5 Portales)',
   bricklink_sold: 'BrickLink Vendidos (6m)',
   bricklink_stock: 'BrickLink Stock Actual',
-  ebay: 'eBay España / UE (Vendidos)',
-  c2c_eu: 'Wallapop / Vinted (C2C Europa)'
+  ebay: 'eBay España / UE',
+  c2c_eu: 'Wallapop / Vinted (C2C)'
 };
 
 export const PORTAL_CONFIGS: PortalMultiplierConfig[] = [
   {
     portal: 'bricklink',
     portalName: 'BrickLink',
-    regionLabel: 'Global / UE (Catálogo Oficial)',
+    regionLabel: 'Global / UE · Catálogo Oficial',
     isOfficialApi: true,
-    reliabilityWeight: 0.50,
+    reliabilityWeight: 0.45,
     priceFactor: 1.0,
     spreadLowFactor: 0.84,
     spreadHighFactor: 1.28,
@@ -53,7 +59,7 @@ export const PORTAL_CONFIGS: PortalMultiplierConfig[] = [
   {
     portal: 'brickowl',
     portalName: 'BrickOwl',
-    regionLabel: 'Europa (Tiendas Especializadas)',
+    regionLabel: 'Europa · Tiendas Especializadas',
     isOfficialApi: true,
     reliabilityWeight: 0.25,
     priceFactor: 1.03,
@@ -67,7 +73,7 @@ export const PORTAL_CONFIGS: PortalMultiplierConfig[] = [
   {
     portal: 'ebay',
     portalName: 'eBay España / UE',
-    regionLabel: 'Subastas + Comprar Ahora (Vendidos)',
+    regionLabel: 'Subastas + Comprar Ahora',
     isOfficialApi: true,
     reliabilityWeight: 0.15,
     priceFactor: 1.12,
@@ -81,9 +87,9 @@ export const PORTAL_CONFIGS: PortalMultiplierConfig[] = [
   {
     portal: 'wallapop',
     portalName: 'Wallapop',
-    regionLabel: 'España / Italia / Portugal (C2C)',
+    regionLabel: 'España / Sur UE · C2C',
     isOfficialApi: false,
-    reliabilityWeight: 0.05,
+    reliabilityWeight: 0.08,
     priceFactor: 0.88,
     spreadLowFactor: 0.72,
     spreadHighFactor: 1.18,
@@ -95,9 +101,9 @@ export const PORTAL_CONFIGS: PortalMultiplierConfig[] = [
   {
     portal: 'vinted',
     portalName: 'Vinted',
-    regionLabel: 'Europa C2C (Envío Económico)',
+    regionLabel: 'Europa C2C · Envío Económico',
     isOfficialApi: false,
-    reliabilityWeight: 0.05,
+    reliabilityWeight: 0.07,
     priceFactor: 0.85,
     spreadLowFactor: 0.70,
     spreadHighFactor: 1.15,
@@ -112,10 +118,6 @@ function roundEur(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
-/**
- * Genera una semilla determinista a partir del código de la minifigura para simular
- * variaciones realistas de mercado consistentes entre sesiones.
- */
 function deterministicOffset(figId: string, portal: string): number {
   let hash = 0;
   const key = `${figId}:${portal}`;
@@ -123,19 +125,43 @@ function deterministicOffset(figId: string, portal: string): number {
     hash = (hash << 5) - hash + key.charCodeAt(i);
     hash |= 0;
   }
-  const normalized = (Math.abs(hash) % 100) / 1000; // 0.000 .. 0.099
-  return normalized - 0.045; // -4.5% .. +5.4%
+  const normalized = (Math.abs(hash) % 100) / 1000;
+  return normalized - 0.045;
 }
 
+/**
+ * Calcula la media ponderada de los 5 portales priorizando datos reales (En vivo / Anotados)
+ * con mayor peso relativo cuando coexisten con estimaciones.
+ */
 export function computeWeightedMarketValue(quotes: MarketplaceQuote[]): number {
   if (quotes.length === 0) return 0;
   let weightedSum = 0;
   let totalWeight = 0;
 
+  const hasVerifiedData = quotes.some(
+    (q) => q.dataSource === 'live_api' || q.dataSource === 'user_observed'
+  );
+
   for (const q of quotes) {
-    const referencePrice = q.isOfficialApi ? q.soldAvg6mEur : q.avgPriceEur;
-    weightedSum += referencePrice * q.reliabilityWeight;
-    totalWeight += q.reliabilityWeight;
+    const referencePrice =
+      q.dataSource === 'user_observed'
+        ? q.avgPriceEur
+        : q.isOfficialApi
+        ? q.soldAvg6mEur
+        : q.avgPriceEur;
+
+    const confidenceBoost =
+      q.dataSource === 'user_observed'
+        ? 2.2
+        : q.dataSource === 'live_api'
+        ? 1.9
+        : hasVerifiedData
+        ? 0.45
+        : 1.0;
+
+    const effectiveWeight = q.reliabilityWeight * confidenceBoost;
+    weightedSum += referencePrice * effectiveWeight;
+    totalWeight += effectiveWeight;
   }
 
   return totalWeight > 0 ? roundEur(weightedSum / totalWeight) : 0;
@@ -167,17 +193,41 @@ export function resolvePreferredPriceFromQuotes(
   return computeWeightedMarketValue(quotes);
 }
 
+export interface PriceReportOverrides {
+  liveQuotes?: Partial<Record<MarketplaceId, LivePortalQuoteSnapshot>>;
+  observedPrices?: Partial<Record<MarketplaceId, number>>;
+}
+
 export function generatePriceComparisonReport(
   figIdOrMeta: string | MinifigureMetadata,
   condition: MinifigCondition,
-  preferredSource: PreferredPriceSource = 'weighted'
+  preferredSource: PreferredPriceSource = 'weighted',
+  overrides?: PriceReportOverrides
 ): PriceComparisonReport {
   const minifig: MinifigureMetadata =
     typeof figIdOrMeta === 'string'
       ? findMinifigById(figIdOrMeta) ?? createCustomMinifigMetadata({ figId: figIdOrMeta })
       : figIdOrMeta;
 
-  const basePrice = minifig.baseMarketPriceEur[condition];
+  // Si tenemos cotizaciones reales (API o anotadas), anclamos el precio base de estimación para portales sin API
+  const liveOrObservedValues: number[] = [];
+  if (overrides?.liveQuotes) {
+    for (const snap of Object.values(overrides.liveQuotes)) {
+      if (snap && snap.avgPriceEur > 0) liveOrObservedValues.push(snap.avgPriceEur);
+    }
+  }
+  if (overrides?.observedPrices) {
+    for (const val of Object.values(overrides.observedPrices)) {
+      if (typeof val === 'number' && val > 0) liveOrObservedValues.push(val);
+    }
+  }
+
+  const catalogBasePrice = minifig.baseMarketPriceEur[condition];
+  const anchorBasePrice =
+    minifig.isEstimatedFallbackPrice && liveOrObservedValues.length > 0
+      ? liveOrObservedValues.reduce((s, v) => s + v, 0) / liveOrObservedValues.length
+      : catalogBasePrice;
+
   const nowIso = new Date().toISOString();
 
   const rarityMultiplier =
@@ -189,17 +239,47 @@ export function generatePriceComparisonReport(
       ? 1.1
       : 2.2;
 
-  const quotes: MarketplaceQuote[] = PORTAL_CONFIGS.map((cfg) => {
-    const jitter = deterministicOffset(minifig.figId, cfg.portal);
-    const avgPriceEur = roundEur(Math.max(1.5, basePrice * (cfg.priceFactor + jitter)));
-    const soldAvg6mEur = roundEur(avgPriceEur * 0.96);
-    const minPriceEur = roundEur(Math.max(1.0, avgPriceEur * cfg.spreadLowFactor));
-    const maxPriceEur = roundEur(avgPriceEur * cfg.spreadHighFactor);
+  let livePortalsCount = 0;
+  let observedPortalsCount = 0;
 
-    const activeListingsCount = Math.max(
-      1,
-      Math.round(cfg.baseListingMultiplier * rarityMultiplier * (condition === 'new' ? 0.65 : 1.15))
-    );
+  const quotes: MarketplaceQuote[] = PORTAL_CONFIGS.map((cfg) => {
+    const userObserved = overrides?.observedPrices?.[cfg.portal];
+    const liveSnap = overrides?.liveQuotes?.[cfg.portal];
+
+    let dataSource: QuoteDataSource = 'catalog_estimate';
+    let avgPriceEur: number;
+    let soldAvg6mEur: number;
+    let minPriceEur: number;
+    let maxPriceEur: number;
+    let activeListingsCount: number;
+
+    if (typeof userObserved === 'number' && Number.isFinite(userObserved) && userObserved > 0) {
+      dataSource = 'user_observed';
+      observedPortalsCount += 1;
+      avgPriceEur = roundEur(userObserved);
+      soldAvg6mEur = roundEur(userObserved);
+      minPriceEur = roundEur(Math.max(0.5, userObserved * 0.9));
+      maxPriceEur = roundEur(userObserved * 1.12);
+      activeListingsCount = 1;
+    } else if (liveSnap && liveSnap.avgPriceEur > 0) {
+      dataSource = 'live_api';
+      livePortalsCount += 1;
+      avgPriceEur = roundEur(liveSnap.avgPriceEur);
+      soldAvg6mEur = roundEur(liveSnap.soldAvg6mEur || liveSnap.avgPriceEur * 0.96);
+      minPriceEur = roundEur(liveSnap.minPriceEur);
+      maxPriceEur = roundEur(liveSnap.maxPriceEur);
+      activeListingsCount = Math.max(1, liveSnap.activeListingsCount);
+    } else {
+      const jitter = deterministicOffset(minifig.figId, cfg.portal);
+      avgPriceEur = roundEur(Math.max(1.5, anchorBasePrice * (cfg.priceFactor + jitter)));
+      soldAvg6mEur = roundEur(avgPriceEur * 0.96);
+      minPriceEur = roundEur(Math.max(1.0, avgPriceEur * cfg.spreadLowFactor));
+      maxPriceEur = roundEur(avgPriceEur * cfg.spreadHighFactor);
+      activeListingsCount = Math.max(
+        1,
+        Math.round(cfg.baseListingMultiplier * rarityMultiplier * (condition === 'new' ? 0.65 : 1.15))
+      );
+    }
 
     return {
       portal: cfg.portal,
@@ -215,7 +295,8 @@ export function generatePriceComparisonReport(
       deepLinkUrl: cfg.buildDeepLink(minifig.figId, minifig.name),
       lastUpdatedIso: nowIso,
       isOfficialApi: cfg.isOfficialApi,
-      reliabilityWeight: cfg.reliabilityWeight
+      reliabilityWeight: cfg.reliabilityWeight,
+      dataSource
     };
   });
 
@@ -243,24 +324,23 @@ export function generatePriceComparisonReport(
     priceRangeEur: { low, high },
     quotes,
     trendPercentage30d,
-    calculatedAtIso: nowIso
+    calculatedAtIso: nowIso,
+    livePortalsCount,
+    observedPortalsCount
   };
 }
 
-/**
- * Devuelve precios paralelos instantáneos (Usada vs. Nueva) estilo brick'em
- * respetando la fuente de precio preferida.
- */
 export function getQuickDualPricesEur(
   figIdOrMeta: string | MinifigureMetadata,
-  preferredSource: PreferredPriceSource = 'weighted'
+  preferredSource: PreferredPriceSource = 'weighted',
+  overrides?: PriceReportOverrides
 ): { usedEur: number; newEur: number; incompleteEur: number } {
   const minifig =
     typeof figIdOrMeta === 'string'
       ? findMinifigById(figIdOrMeta) ?? createCustomMinifigMetadata({ figId: figIdOrMeta })
       : figIdOrMeta;
   return {
-    usedEur: generatePriceComparisonReport(minifig, 'used_complete', preferredSource)
+    usedEur: generatePriceComparisonReport(minifig, 'used_complete', preferredSource, overrides)
       .estimatedMarketValueEur,
     newEur: generatePriceComparisonReport(minifig, 'new', preferredSource)
       .estimatedMarketValueEur,
@@ -270,9 +350,181 @@ export function getQuickDualPricesEur(
 }
 
 /**
- * Analiza una lista rápida pegada por el usuario (ej. "sw0002, sw0585 x3, sh0232 new 52")
- * y devuelve las líneas tasadas listas para importar.
+ * Calcula el descuento automático por piezas faltantes en el despiece interactivo.
+ * Normaliza los pesos de las piezas si su suma supera el valor completo de la figura.
  */
+export function computeMissingPartsAdjustment(
+  baseCompleteValueEur: number,
+  parts: MinifigPartBreakdown[],
+  missingPartNums: string[] = []
+): MissingPartsValuationSummary {
+  const safeBase = Math.max(0.5, roundEur(baseCompleteValueEur));
+  const totalParts = parts.length;
+  if (totalParts === 0 || missingPartNums.length === 0) {
+    return {
+      totalParts,
+      missingCount: 0,
+      ownedCount: totalParts,
+      completionPct: 100,
+      missingCostEur: 0,
+      baseCompleteValueEur: safeBase,
+      adjustedValueEur: safeBase
+    };
+  }
+
+  const missingSet = new Set(missingPartNums.map((p) => p.toLowerCase()));
+  const totalPartsSum = parts.reduce((sum, p) => sum + Math.max(0.25, p.avgPriceEur || 0.5), 0);
+  const scaleFactor = totalPartsSum > safeBase * 0.92 ? (safeBase * 0.9) / totalPartsSum : 1;
+
+  let missingCount = 0;
+  let rawMissingCost = 0;
+
+  for (const part of parts) {
+    if (missingSet.has(part.partNum.toLowerCase())) {
+      missingCount += 1;
+      rawMissingCost += Math.max(0.25, part.avgPriceEur || 0.5) * scaleFactor;
+    }
+  }
+
+  const missingCostEur = roundEur(Math.min(safeBase - 0.5, rawMissingCost));
+  const adjustedValueEur = roundEur(Math.max(0.5, safeBase - missingCostEur));
+  const ownedCount = Math.max(0, totalParts - missingCount);
+  const completionPct = Math.round((ownedCount / totalParts) * 100);
+
+  return {
+    totalParts,
+    missingCount,
+    ownedCount,
+    completionPct,
+    missingCostEur,
+    baseCompleteValueEur: safeBase,
+    adjustedValueEur
+  };
+}
+
+/**
+ * Genera enlaces directos para comprar una pieza concreta faltante en BrickLink y BrickOwl.
+ */
+export function getPartMarketplaceLinks(
+  part: MinifigPartBreakdown,
+  figId?: string
+): { bricklinkUrl: string; brickowlUrl: string } {
+  const isSyntheticTemplate =
+    /-(hg|hd|tr|lg|h|t|l)$/i.test(part.partNum) || part.partNum.includes(' ');
+
+  if (isSyntheticTemplate && figId) {
+    const query = `LEGO ${figId} ${part.name}`;
+    return {
+      bricklinkUrl: `https://www.bricklink.com/catalogItemInv.asp?M=${encodeURIComponent(figId)}`,
+      brickowlUrl: `https://www.brickowl.com/search/catalog?query=${encodeURIComponent(query)}`
+    };
+  }
+
+  return {
+    bricklinkUrl: `https://www.bricklink.com/v2/catalog/catalogitem.page?P=${encodeURIComponent(part.partNum)}#T=S`,
+    brickowlUrl: `https://www.brickowl.com/search/catalog?query=${encodeURIComponent(`LEGO ${part.partNum}`)}`
+  };
+}
+
+/**
+ * Evaluador de Lotes para Wallapop / Vinted / Mercadillos.
+ */
+export function evaluateLotDeal(params: {
+  totalMarketValueEur: number;
+  askingPriceEur: number;
+  shippingEur?: number;
+  targetMarginPct?: number;
+}): LotDealEvaluation {
+  const market = Math.max(0, roundEur(params.totalMarketValueEur));
+  const asking = Math.max(0, roundEur(params.askingPriceEur));
+  const shipping = Math.max(0, roundEur(params.shippingEur ?? 0));
+  const totalCostEur = roundEur(asking + shipping);
+  const targetMarginPct = Math.max(5, Math.min(75, params.targetMarginPct ?? 35));
+
+  const maxRecommendedBidEur = roundEur(market * (1 - targetMarginPct / 100));
+  // Estimación de costes de venta + envío/comisión media si se revende (~10%)
+  const estimatedResaleFeesEur = roundEur(market * 0.1);
+  const estimatedNetProfitEur = roundEur(market - estimatedResaleFeesEur - totalCostEur);
+  const discountVsMarketPct =
+    market > 0 ? Math.round(((market - totalCostEur) / market) * 1000) / 10 : 0;
+  const roiPct =
+    totalCostEur > 0 ? Math.round((estimatedNetProfitEur / totalCostEur) * 1000) / 10 : 0;
+
+  let verdict: LotDealVerdict = 'justo';
+  let verdictLabel = 'Precio justo';
+  let verdictSummary = 'En línea con el mercado. Negocia un poco si buscas margen.';
+
+  if (market <= 0 || totalCostEur <= 0) {
+    verdict = 'justo';
+    verdictLabel = 'Introduce precio';
+    verdictSummary = 'Indica cuánto pide el vendedor para calcular el margen.';
+  } else if (totalCostEur <= market * 0.55) {
+    verdict = 'ganga';
+    verdictLabel = 'Ganga clara';
+    verdictSummary = `Pagas un ${Math.round(discountVsMarketPct)}% por debajo de mercado. Excelente oportunidad.`;
+  } else if (totalCostEur <= maxRecommendedBidEur) {
+    verdict = 'buen_precio';
+    verdictLabel = 'Buen precio';
+    verdictSummary = `Por debajo de tu tope recomendado (${maxRecommendedBidEur.toFixed(2)} €).`;
+  } else if (totalCostEur <= market * 0.92) {
+    verdict = 'justo';
+    verdictLabel = 'Precio justo';
+    verdictSummary = `Correcto para colección propia; intenta bajar a ${maxRecommendedBidEur.toFixed(2)} €.`;
+  } else {
+    verdict = 'caro';
+    verdictLabel = 'Caro / Sin margen';
+    verdictSummary = `Supera el valor estimado o deja margen nulo. Puja máx.: ${maxRecommendedBidEur.toFixed(2)} €.`;
+  }
+
+  return {
+    totalMarketValueEur: market,
+    askingPriceEur: asking,
+    shippingEur: shipping,
+    totalCostEur,
+    targetMarginPct,
+    maxRecommendedBidEur,
+    estimatedResaleFeesEur,
+    estimatedNetProfitEur,
+    discountVsMarketPct,
+    roiPct,
+    verdict,
+    verdictLabel,
+    verdictSummary
+  };
+}
+
+/**
+ * Reparte automáticamente el coste pagado por un lote entre todas las figuras
+ * de forma proporcional a su peso en el valor de mercado total.
+ */
+export function allocateLotPurchasePrices(
+  lines: Array<{
+    quantity: number;
+    estimatedUnitValueEur: number;
+  }>,
+  totalPaidEur: number
+): number[] {
+  const safeTotal = Math.max(0, totalPaidEur);
+  if (lines.length === 0) return [];
+  const totalMarket = lines.reduce(
+    (sum, line) => sum + Math.max(0.01, line.quantity * line.estimatedUnitValueEur),
+    0
+  );
+
+  if (totalMarket <= 0) {
+    const totalUnits = lines.reduce((sum, l) => sum + Math.max(1, l.quantity), 0);
+    const flat = roundEur(safeTotal / Math.max(1, totalUnits));
+    return lines.map(() => flat);
+  }
+
+  return lines.map((line) => {
+    const lineMarket = Math.max(0.01, line.quantity * line.estimatedUnitValueEur);
+    const share = lineMarket / totalMarket;
+    const allocatedLineCost = safeTotal * share;
+    return roundEur(allocatedLineCost / Math.max(1, line.quantity));
+  });
+}
+
 export function evaluateBulkTextList(
   rawText: string,
   preferredSource: PreferredPriceSource = 'weighted'
@@ -303,12 +555,12 @@ export function evaluateBulkTextList(
     }
 
     if (!matchedFig) {
-      // Fallback: búsqueda parcial por nombre si es un texto descriptivo suficientemente largo
-      const cleanChunk = chunk.replace(/\b(\d+x|x\d+|new|nueva|used|usada)\b/gi, '').trim().toLowerCase();
+      const cleanChunk = chunk
+        .replace(/\b(\d+x|x\d+|new|nueva|used|usada)\b/gi, '')
+        .trim()
+        .toLowerCase();
       if (cleanChunk.length >= 3) {
-        matchedFig = ALL_MINIFIG_CATALOG.find((m) =>
-          m.name.toLowerCase().includes(cleanChunk)
-        );
+        matchedFig = ALL_MINIFIG_CATALOG.find((m) => m.name.toLowerCase().includes(cleanChunk));
       }
     }
 
@@ -332,7 +584,6 @@ export function evaluateBulkTextList(
 
     const report = generatePriceComparisonReport(matchedFig, condition, preferredSource);
 
-    // Precio pagado opcional explícito (ej: "@12.50", "€12.50", "12.50€" o número suelto "sh0232 new 52")
     let purchasePriceEur = roundEur(report.estimatedMarketValueEur * 0.78);
     const explicitPriceMatch = chunk.match(
       /(?:@|€)\s*(\d+(?:[.,]\d+)?)|(\d+(?:[.,]\d+)?)\s*€/

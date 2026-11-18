@@ -2,6 +2,9 @@ import type {
   BulkScanDetectedItem,
   BulkScanSession,
   MinifigureMetadata,
+  NormalizedBoundingBox,
+  PartRecognitionCandidate,
+  PartRecognitionResult,
   RecognitionCandidate,
   RecognitionResult
 } from '../types/minifig';
@@ -14,6 +17,7 @@ import {
   guessThemeFromFigId,
   MINIFIG_CATALOG
 } from '../data/catalogPresets';
+import { buildProxyEndpoints } from './apiConfig';
 
 interface BrickognizePredictionItem {
   id: string;
@@ -419,8 +423,7 @@ export async function identifyMinifigureFromImage(options: {
 
   const endpoints = [
     'https://api.brickognize.com/predict/figs/?top_k_items=12&min_similarity_items=0.2',
-    '/api/brickognize.php?mode=figs&top_k_items=12&min_similarity_items=0.2',
-    '/api/brickognize?mode=figs&top_k_items=12&min_similarity_items=0.2'
+    ...buildProxyEndpoints('brickognize', 'mode=figs&top_k_items=12&min_similarity_items=0.2')
   ];
 
   const fileExtension = options.blob.type.includes('png')
@@ -546,6 +549,7 @@ export async function identifyBulkLotFromImage(options: {
       const candidates = buildCandidatesForPreset(slot.figId, 12);
       const primary = candidates[0].minifig;
       return {
+        boxId: `box-demo-${slot.slotIndex}`,
         slotIndex: slot.slotIndex,
         boundingBox: slot.boundingBox,
         cropDataUrl: primary.imageUrl,
@@ -553,7 +557,8 @@ export async function identifyBulkLotFromImage(options: {
         candidates,
         condition: 'used_complete',
         quantity: 1,
-        included: true
+        included: true,
+        status: 'matched'
       };
     });
 
@@ -611,6 +616,7 @@ export async function identifyBulkLotFromImage(options: {
         if (recognition.apiSource === 'brickognize_live' && recognition.candidates.length > 0) {
           const primary = recognition.candidates[0].minifig;
           return {
+            boxId: `box-${Date.now()}-${slotNumber}`,
             slotIndex: slotNumber,
             boundingBox,
             cropDataUrl: cropUrl || primary.imageUrl,
@@ -618,7 +624,8 @@ export async function identifyBulkLotFromImage(options: {
             candidates: recognition.candidates,
             condition: 'used_complete' as const,
             quantity: 1,
-            included: true
+            included: true,
+            status: 'matched' as const
           };
         }
 
@@ -635,7 +642,6 @@ export async function identifyBulkLotFromImage(options: {
     }
   }
 
-  // Re-numerar consecutivamente los ítems realmente detectados
   const renumbered = items.map((item, idx) => ({
     ...item,
     slotIndex: idx + 1
@@ -652,7 +658,7 @@ export async function identifyBulkLotFromImage(options: {
     errorMessage =
       errorCount > 0
         ? lastErrorMessage || 'Error de conexión al analizar las figuras del lote.'
-        : 'No se reconocieron minifiguras individuales en el lote. Separa ligeramente las figuras sobre fondo liso con buena iluminación.';
+        : 'No se reconocieron minifiguras automáticamente. Puedes añadir recuadros manualmente sobre la foto con «+ Añadir recuadro».';
   }
 
   return {
@@ -664,6 +670,246 @@ export async function identifyBulkLotFromImage(options: {
     apiSource,
     errorMessage,
     items: renumbered
+  };
+}
+
+function inferPartCategoryFromBrickognize(
+  name: string,
+  category?: string
+): 'headgear' | 'head' | 'torso' | 'legs' | 'accessory' {
+  const hay = `${name} ${category || ''}`.toLowerCase();
+  if (/(helmet|hair|hat|hood|cap|crown|mask|headgear|visor|beanie)/.test(hay)) {
+    return 'headgear';
+  }
+  if (/(minifig head|\bhead\b|cabeza)/.test(hay) && !/(headdress|headgear)/.test(hay)) {
+    return 'head';
+  }
+  if (/(torso|body|upper)/.test(hay)) return 'torso';
+  if (/(hips|legs|skirt|dress|lower|tail)/.test(hay)) return 'legs';
+  return 'accessory';
+}
+
+/**
+ * Escáner de piezas sueltas (torso, cabeza, casco, piernas) contra Brickognize /predict/parts/.
+ * Nunca devuelve datos falsos ante fallos reales.
+ */
+export async function identifyPartFromImage(options: {
+  blob?: Blob;
+  previewDataUrl: string;
+  presetPart?: {
+    partNum: string;
+    name: string;
+    category: 'headgear' | 'head' | 'torso' | 'legs' | 'accessory';
+    imageUrl?: string;
+  };
+}): Promise<PartRecognitionResult> {
+  const startTime = performance.now();
+  const scanId = `part-scan-${Date.now()}`;
+
+  if (options.presetPart) {
+    const p = options.presetPart;
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl || p.imageUrl || '',
+      latencyMs: Math.max(50, Math.round(performance.now() - startTime)),
+      apiSource: 'demo_preset',
+      candidates: [
+        {
+          partNum: p.partNum,
+          name: p.name,
+          category: p.category,
+          confidence: 0.96,
+          imageUrl: p.imageUrl || '',
+          bricklinkUrl: `https://www.bricklink.com/v2/catalog/catalogitem.page?P=${encodeURIComponent(p.partNum)}#T=S`
+        }
+      ]
+    };
+  }
+
+  if (!options.blob) {
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl,
+      latencyMs: Math.round(performance.now() - startTime),
+      apiSource: 'error',
+      errorMessage: 'No se recibió ninguna imagen válida de la pieza.',
+      candidates: []
+    };
+  }
+
+  const endpoints = [
+    'https://api.brickognize.com/predict/parts/?top_k_items=10&min_similarity_items=0.18',
+    ...buildProxyEndpoints('brickognize', 'mode=parts&top_k_items=10&min_similarity_items=0.18')
+  ];
+
+  let parsedData: BrickognizeResponse | null = null;
+  let lastErrorDetail = '';
+
+  for (const endpoint of endpoints) {
+    const controller = new AbortController();
+    const timeoutMs = endpoint.startsWith('https://') ? 12000 : 8000;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const formData = new FormData();
+      formData.append('query_image', options.blob, 'part_scan.jpg');
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { Accept: 'application/json' },
+        body: formData,
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.ok) {
+        lastErrorDetail = `HTTP ${res.status}`;
+        continue;
+      }
+      if (!contentType.includes('application/json')) {
+        lastErrorDetail = 'Endpoint no devuelve JSON';
+        continue;
+      }
+
+      parsedData = (await res.json()) as BrickognizeResponse;
+      break;
+    } catch (err) {
+      clearTimeout(timeoutId);
+      lastErrorDetail =
+        err instanceof Error && err.name === 'AbortError'
+          ? 'Tiempo de espera agotado'
+          : err instanceof Error
+          ? err.message
+          : 'Error de red';
+    }
+  }
+
+  if (!parsedData) {
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl,
+      latencyMs: Math.round(performance.now() - startTime),
+      apiSource: 'error',
+      errorMessage: offline
+        ? 'Sin conexión a Internet. Conéctate para identificar piezas o escribe el código manualmente.'
+        : `No se pudo contactar con Brickognize Piezas (${lastErrorDetail || 'red'}).`,
+      candidates: []
+    };
+  }
+
+  const boxScore = parsedData.bounding_box?.score ?? 0;
+  const rawItems = parsedData.items ?? [];
+
+  if (rawItems.length === 0) {
+    return {
+      scanId,
+      capturedAtIso: new Date().toISOString(),
+      processedImageDataUrl: options.previewDataUrl,
+      latencyMs: Math.round(performance.now() - startTime),
+      apiSource: 'no_match',
+      detectedBoxScore: boxScore,
+      errorMessage:
+        'No se reconoció una pieza LEGO clara. Acerca la cámara sobre fondo liso con buena luz frontal.',
+      candidates: []
+    };
+  }
+
+  const candidates: PartRecognitionCandidate[] = rawItems.slice(0, 10).map((item) => {
+    const partNum = item.id.trim();
+    return {
+      partNum,
+      name: item.name,
+      category: inferPartCategoryFromBrickognize(item.name, item.category),
+      confidence: Math.min(0.99, Math.max(0.1, Number(item.score) || 0.5)),
+      imageUrl: item.img_url || '',
+      bricklinkUrl: `https://www.bricklink.com/v2/catalog/catalogitem.page?P=${encodeURIComponent(partNum)}#T=S`
+    };
+  });
+
+  return {
+    scanId,
+    capturedAtIso: new Date().toISOString(),
+    processedImageDataUrl: options.previewDataUrl,
+    latencyMs: Math.round(performance.now() - startTime),
+    apiSource: 'brickognize_live',
+    detectedBoxScore: boxScore,
+    candidates
+  };
+}
+
+/**
+ * Carga una imagen desde dataUrl o URL en un HTMLImageElement para recortes interactivos.
+ */
+export function loadImageElementFromUrl(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('No se pudo cargar la imagen del lote.'));
+    img.src = src;
+  });
+}
+
+/**
+ * Escanea un único recuadro normalizado de un lote Bulk (usado al añadir, mover o
+ * redimensionar una caja interactivamente sobre la foto sin re-escanear el lote entero).
+ */
+export async function identifySingleBulkBox(options: {
+  sourceImageUrl: string;
+  boundingBox: NormalizedBoundingBox;
+  slotIndex: number;
+  boxId?: string;
+}): Promise<BulkScanDetectedItem> {
+  const img = await loadImageElementFromUrl(options.sourceImageUrl);
+  const cropped = await cropNormalizedRegion(img, options.boundingBox, 440);
+  const recognition = await identifyMinifigureFromImage({
+    blob: cropped.blob,
+    previewDataUrl: cropped.dataUrl
+  });
+
+  const boxId = options.boxId || `box-${Date.now()}-${options.slotIndex}`;
+
+  if (recognition.apiSource === 'brickognize_live' && recognition.candidates.length > 0) {
+    const primary = recognition.candidates[0].minifig;
+    return {
+      boxId,
+      slotIndex: options.slotIndex,
+      boundingBox: options.boundingBox,
+      cropDataUrl: cropped.dataUrl || primary.imageUrl,
+      selectedMinifig: primary,
+      candidates: recognition.candidates,
+      condition: 'used_complete',
+      quantity: 1,
+      included: true,
+      status: 'matched'
+    };
+  }
+
+  const placeholderMeta = createCustomMinifigMetadata({
+    figId: `lote-${options.slotIndex}`,
+    name: `Figura #${options.slotIndex} (sin coincidencia)`,
+    imageUrl: cropped.dataUrl
+  });
+
+  return {
+    boxId,
+    slotIndex: options.slotIndex,
+    boundingBox: options.boundingBox,
+    cropDataUrl: cropped.dataUrl,
+    selectedMinifig: placeholderMeta,
+    candidates: [],
+    condition: 'used_complete',
+    quantity: 1,
+    included: false,
+    status: recognition.apiSource === 'error' ? 'error' : 'no_match',
+    errorMessage:
+      recognition.errorMessage ||
+      'No se identificó figura en este recuadro. Ajústalo o cámbiala por código.'
   };
 }
 
