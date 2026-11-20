@@ -46,7 +46,7 @@ export interface BrickLensStorageRepository {
     items: CollectionItem[];
   }>;
   setActiveCollection(collectionId: string | null): Promise<void>;
-  createCollection(name: string): Promise<UserCollection>;
+  createCollection(name: string, color?: string): Promise<UserCollection>;
   renameCollection(collectionId: string, newName: string): Promise<void>;
   deleteCollection(collectionId: string): Promise<string | null>;
   restoreDemoCollection(): Promise<{ collection: UserCollection; items: CollectionItem[] }>;
@@ -107,7 +107,7 @@ export const storageRepository: BrickLensStorageRepository = {
     return { collections, items };
   },
   setActiveCollection: (collectionId) => setActiveCollectionId(collectionId),
-  createCollection: (name) => createCollection(name),
+  createCollection: (name, color) => createCollection(name, { color }),
   renameCollection: (collectionId, newName) => renameCollection(collectionId, newName),
   deleteCollection: (collectionId) => deleteCollection(collectionId),
   restoreDemoCollection: () => restoreDemoCollection(),

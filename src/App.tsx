@@ -1,12 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import {
-  BarChart3,
-  Camera,
-  Layers,
-  Moon,
-  Settings,
-  Sun
-} from 'lucide-react';
+import { Box, Camera, Home, Search, Tag } from 'lucide-react';
 import type {
   AppSettings,
   BulkImportParsedLine,
@@ -17,70 +10,85 @@ import type {
   UserCollection
 } from './types/minifig';
 import { MINIFIG_CATALOG } from './data/catalogPresets';
-import { calculateCollectionStats, db } from './db/collectionDb';
+import {
+  calculateCollectionStats,
+  COLLECTION_DOT_COLORS,
+  db,
+  DEMO_COLLECTION_ID
+} from './db/collectionDb';
 import { setRuntimeProxyBaseUrl } from './services/apiConfig';
 import {
   computeMissingPartsAdjustment,
   generatePriceComparisonReport
 } from './services/priceAggregator';
 import { storageRepository } from './services/storageRepository';
-import { CameraScanner } from './components/scanner/CameraScanner';
+import { HomeDashboard } from './components/home/HomeDashboard';
 import { PriceComparisonView } from './components/prices/PriceComparisonView';
 import { CollectionDashboard } from './components/collection/CollectionDashboard';
+import { CatalogExploreView } from './components/catalog/CatalogExploreView';
+import { CameraScanner, type ScannerSavedPayload } from './components/scanner/CameraScanner';
+import {
+  ScanCelebrationModal,
+  type CelebrationPayload
+} from './components/scanner/ScanCelebrationModal';
+import { CmfScannerModal } from './components/scanner/CmfScannerModal';
 import { MinifigDetailSheet } from './components/shared/MinifigDetailSheet';
 import { SettingsSheet } from './components/settings/SettingsSheet';
+import { SideDrawer } from './components/shared/SideDrawer';
 
-type ActiveTab = 'scanner' | 'comparator' | 'collection';
-type ThemeMode = 'dark' | 'light';
+type ActiveTab = 'home' | 'market' | 'collection' | 'catalog';
+type ThemeMode = 'light' | 'dark';
 
 const DEFAULT_SETTINGS: AppSettings = {
   proxyBaseUrl: '',
   defaultTargetMarginPct: 35,
-  preferredPriceSource: 'weighted'
+  preferredPriceSource: 'weighted',
+  themeMode: 'light'
 };
 
 export function App() {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('scanner');
-  const [themeMode, setThemeMode] = useState<ThemeMode>('dark');
-  const [selectedMinifig, setSelectedMinifig] = useState<MinifigureMetadata>(MINIFIG_CATALOG[0]);
+  const [activeTab, setActiveTab] = useState<ActiveTab>('home');
+  const [themeMode, setThemeMode] = useState<ThemeMode>('light');
+  const [selectedMinifig, setSelectedMinifig] = useState<MinifigureMetadata>(MINIFIG_CATALOG[1]);
   const [selectedCondition, setSelectedCondition] = useState<MinifigCondition>('used_complete');
   const [preferredPriceSource, setPreferredPriceSource] = useState<PreferredPriceSource>('weighted');
 
   const [appSettings, setAppSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [cmfOpen, setCmfOpen] = useState(false);
+  const [collectionModalTrigger, setCollectionModalTrigger] = useState<'none' | 'import' | 'export'>('none');
+  const [celebration, setCelebration] = useState<CelebrationPayload | null>(null);
 
   const [detailModal, setDetailModal] = useState<{
     open: boolean;
     minifig: MinifigureMetadata | null;
     collectionItemId?: string | null;
     condition?: MinifigCondition;
+    expandParts?: boolean;
   }>({
     open: false,
     minifig: null,
     collectionItemId: null,
-    condition: 'used_complete'
+    condition: 'used_complete',
+    expandParts: false
   });
 
   const [collections, setCollections] = useState<UserCollection[]>([]);
   const [activeCollectionId, setActiveCollectionId] = useState<string | null>(null);
   const [allItems, setAllItems] = useState<CollectionItem[]>([]);
-  const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', themeMode);
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme) {
+      metaTheme.setAttribute('content', themeMode === 'dark' ? '#0f1115' : '#ffffff');
+    }
   }, [themeMode]);
 
   useEffect(() => {
     void bootstrapApp();
-
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
   }, []);
 
   const bootstrapApp = async () => {
@@ -93,6 +101,7 @@ export function App() {
     setAllItems(state.allItems);
     setAppSettings(settings);
     setPreferredPriceSource(settings.preferredPriceSource);
+    setThemeMode(settings.themeMode === 'dark' ? 'dark' : 'light');
     setRuntimeProxyBaseUrl(settings.proxyBaseUrl);
   };
 
@@ -115,6 +124,7 @@ export function App() {
       setActiveCollectionId(nextCollections[0].id);
       await storageRepository.setActiveCollection(nextCollections[0].id);
     }
+    return { nextCollections, nextItems };
   };
 
   const activeCollection = useMemo(
@@ -130,11 +140,6 @@ export function App() {
     [allItems, activeCollectionId]
   );
 
-  const portfolioStats = useMemo(
-    () => calculateCollectionStats(activeCollectionItems),
-    [activeCollectionItems]
-  );
-
   const activeDetailCollectionItem = useMemo(
     () =>
       detailModal.collectionItemId
@@ -143,13 +148,33 @@ export function App() {
     [allItems, detailModal.collectionItemId]
   );
 
+  const hasDemoCollection = useMemo(
+    () => collections.some((c) => c.id === DEMO_COLLECTION_ID || c.isDemo),
+    [collections]
+  );
+
+  const handleToggleTheme = async () => {
+    const next: ThemeMode = themeMode === 'dark' ? 'light' : 'dark';
+    setThemeMode(next);
+    const saved = await storageRepository.saveSettings({ themeMode: next });
+    setAppSettings(saved);
+  };
+
   const handleSelectCollection = async (collectionId: string) => {
     setActiveCollectionId(collectionId);
     await storageRepository.setActiveCollection(collectionId);
   };
 
-  const handleCreateCollection = async (name: string): Promise<UserCollection> => {
-    const created = await storageRepository.createCollection(name);
+  const handleSelectCollectionAndGo = async (collectionId: string) => {
+    await handleSelectCollection(collectionId);
+    setActiveTab('collection');
+  };
+
+  const handleCreateCollection = async (
+    name: string,
+    color?: string
+  ): Promise<UserCollection> => {
+    const created = await storageRepository.createCollection(name, color);
     await syncFromDatabase(created.id);
     return created;
   };
@@ -169,42 +194,34 @@ export function App() {
     await syncFromDatabase(collection.id);
   };
 
-  const handleSelectForComparison = (
-    minifig: MinifigureMetadata,
-    condition: MinifigCondition
-  ) => {
-    setSelectedMinifig(minifig);
-    setSelectedCondition(condition);
-    setActiveTab('comparator');
-  };
-
   const handleOpenMinifigDetail = useCallback(
     (minifig: MinifigureMetadata, condition: MinifigCondition = 'used_complete') => {
       setDetailModal({
         open: true,
         minifig,
         collectionItemId: null,
-        condition
+        condition,
+        expandParts: false
       });
     },
     []
   );
 
-  const handleOpenCollectionItemDetail = useCallback((item: CollectionItem) => {
-    setDetailModal({
-      open: true,
-      minifig: item.minifig,
-      collectionItemId: item.id,
-      condition: item.condition
-    });
-  }, []);
+  const handleOpenCollectionItemDetail = useCallback(
+    (item: CollectionItem, expandParts = false) => {
+      setDetailModal({
+        open: true,
+        minifig: item.minifig,
+        collectionItemId: item.id,
+        condition: item.condition,
+        expandParts
+      });
+    },
+    []
+  );
 
   const handleCloseDetailSheet = useCallback(() => {
     setDetailModal((prev) => ({ ...prev, open: false }));
-  }, []);
-
-  const handleCloseSettingsSheet = useCallback(() => {
-    setSettingsOpen(false);
   }, []);
 
   const handleQuickAddFromScanner = async (
@@ -241,7 +258,34 @@ export function App() {
     await syncFromDatabase(resolvedCollectionId);
   };
 
-  const handleAddToCollectionFromComparator = async (params: {
+  const handleScanSavedCelebration = async (payload: ScannerSavedPayload) => {
+    const { nextCollections, nextItems } = await syncFromDatabase(payload.targetCollectionId);
+    const targetCol =
+      nextCollections.find((c) => c.id === payload.targetCollectionId) ??
+      nextCollections[0] ??
+      null;
+    const colItems = targetCol
+      ? nextItems.filter((it) => it.collectionId === targetCol.id)
+      : nextItems;
+    const newTotal = calculateCollectionStats(colItems).totalMarketValueEur;
+    const previousTotal = Math.max(0, newTotal - payload.addedValueEur);
+    const pctGain =
+      previousTotal > 0
+        ? Math.round((payload.addedValueEur / previousTotal) * 1000) / 10
+        : 100;
+
+    setScannerOpen(false);
+    setCelebration({
+      addedItems: payload.addedItems,
+      addedValueEur: payload.addedValueEur,
+      collectionName: targetCol?.name || 'Mi Colección',
+      collectionColor: targetCol?.color || COLLECTION_DOT_COLORS[0],
+      newCollectionTotalEur: newTotal,
+      percentGain: pctGain
+    });
+  };
+
+  const handleAddToCollectionFromAny = async (params: {
     collectionId?: string | null;
     minifig: MinifigureMetadata;
     condition: MinifigCondition;
@@ -270,10 +314,7 @@ export function App() {
     await syncFromDatabase();
   };
 
-  const handleUpdateCondition = async (
-    itemId: string,
-    newCondition: MinifigCondition
-  ) => {
+  const handleUpdateCondition = async (itemId: string, newCondition: MinifigCondition) => {
     const item = await db.collectionItems.get(itemId);
     if (!item) return;
     const report = generatePriceComparisonReport(item.minifig, newCondition, preferredPriceSource);
@@ -334,11 +375,7 @@ export function App() {
 
   const handleRefreshValuations = async (sourceOverride?: PreferredPriceSource) => {
     const activeSource = sourceOverride ?? preferredPriceSource;
-    if (!activeCollectionId) return;
-    const current = await db.collectionItems
-      .where('collectionId')
-      .equals(activeCollectionId)
-      .toArray();
+    const current = await db.collectionItems.toArray();
     const nowIso = new Date().toISOString();
     const updated = current.map((item) => {
       const hasMissing = Boolean(item.missingPartNums && item.missingPartNums.length > 0);
@@ -386,98 +423,40 @@ export function App() {
     const nextSettings = await storageRepository.getSettings();
     setAppSettings(nextSettings);
     setPreferredPriceSource(nextSettings.preferredPriceSource);
+    setThemeMode(nextSettings.themeMode === 'dark' ? 'dark' : 'light');
     setRuntimeProxyBaseUrl(nextSettings.proxyBaseUrl);
     await syncFromDatabase(nextActiveId);
   };
 
-  const pillLabel = activeCollection ? activeCollection.name : 'Sin colección';
-
   return (
-    <div className="app-shell">
-      <header className="pwa-header">
-        <div className="header-brand">
-          <div className="brand-brick-mark" aria-hidden="true">
-            <span className="stud" />
-            <span className="stud" />
-          </div>
-          <div>
-            <h1 className="app-title">BrickLens</h1>
-            <span className="app-subtitle">
-              {isOnline ? 'Tasación LEGO' : 'Offline · Local'}
-            </span>
-          </div>
-        </div>
-
-        <div className="header-controls">
-          <button
-            type="button"
-            id="header-portfolio-pill"
-            className="portfolio-live-pill"
-            onClick={() => setActiveTab('collection')}
-            title="Ir a Mis Colecciones"
-          >
-            <span className="pill-caption">
-              {pillLabel} ({portfolioStats.totalUnits})
-            </span>
-            <strong className="pill-total mono">
-              {portfolioStats.totalMarketValueEur.toFixed(2)} €
-            </strong>
-          </button>
-
-          <button
-            type="button"
-            id="btn-toggle-theme"
-            className="icon-btn"
-            onClick={() => setThemeMode(themeMode === 'dark' ? 'light' : 'dark')}
-            title={themeMode === 'dark' ? 'Cambiar a modo Día' : 'Cambiar a modo Estudio Oscuro'}
-            aria-label="Cambiar tema visual"
-          >
-            {themeMode === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
-          </button>
-
-          <button
-            type="button"
-            id="btn-open-settings"
-            className="icon-btn"
-            onClick={() => setSettingsOpen(true)}
-            title="Ajustes, APIs en vivo y Backup JSON"
-            aria-label="Abrir ajustes y copia de seguridad"
-          >
-            <Settings size={15} />
-          </button>
-        </div>
-      </header>
-
-      <main className="pwa-main-content">
-        {activeTab === 'scanner' && (
-          <CameraScanner
-            preferredPriceSource={preferredPriceSource}
-            defaultTargetMarginPct={appSettings.defaultTargetMarginPct}
+    <div className="bm-app-shell">
+      <main className="bm-main">
+        {activeTab === 'home' && (
+          <HomeDashboard
             collections={collections}
-            activeCollectionId={activeCollectionId}
-            onSelectCollection={(id) => void handleSelectCollection(id)}
-            onCreateCollection={handleCreateCollection}
-            onSelectMinifigForComparison={handleSelectForComparison}
-            onOpenMinifigDetail={handleOpenMinifigDetail}
-            onQuickAddToCollection={handleQuickAddFromScanner}
-            onBulkAddToCollection={handleBulkAddToCollection}
+            allItems={allItems}
+            onOpenDrawer={() => setDrawerOpen(true)}
+            onSelectCollectionAndNavigate={(id) => void handleSelectCollectionAndGo(id)}
+            onOpenItemDetail={(item) => handleOpenCollectionItemDetail(item, false)}
+            onOpenScanner={() => setScannerOpen(true)}
           />
         )}
 
-        {activeTab === 'comparator' && (
+        {activeTab === 'market' && (
           <PriceComparisonView
             selectedMinifig={selectedMinifig}
             selectedCondition={selectedCondition}
             preferredPriceSource={preferredPriceSource}
             collections={collections}
             activeCollectionId={activeCollectionId}
+            allItems={allItems}
             onSelectCollection={(id) => void handleSelectCollection(id)}
             onCreateCollection={handleCreateCollection}
             onChangePreferredSource={(src) => void handleChangePreferredSource(src)}
             onChangeMinifig={setSelectedMinifig}
             onChangeCondition={setSelectedCondition}
             onOpenMinifigDetail={handleOpenMinifigDetail}
-            onAddToCollection={handleAddToCollectionFromComparator}
+            onAddToCollection={handleAddToCollectionFromAny}
           />
         )}
 
@@ -488,22 +467,25 @@ export function App() {
             allItems={allItems}
             items={activeCollectionItems}
             preferredPriceSource={preferredPriceSource}
+            initialModal={collectionModalTrigger}
+            onClearInitialModal={() => setCollectionModalTrigger('none')}
             onSelectCollection={(id) => void handleSelectCollection(id)}
             onCreateCollection={handleCreateCollection}
             onRenameCollection={(id, name) => void handleRenameCollection(id, name)}
             onDeleteCollection={(id) => void handleDeleteCollection(id)}
-            onRestoreDemoCollection={() => void handleRestoreDemoCollection()}
-            onGoToScanner={() => setActiveTab('scanner')}
-            onUpdateQuantity={handleUpdateQuantity}
-            onUpdateCondition={handleUpdateCondition}
-            onUpdateItemDetails={handleUpdateItemDetails}
-            onRemoveItem={handleRemoveItem}
+            onGoToScanner={() => setScannerOpen(true)}
+            onUpdateQuantity={(id, delta) => void handleUpdateQuantity(id, delta)}
+            onUpdateCondition={(id, cond) => void handleUpdateCondition(id, cond)}
+            onUpdateItemDetails={(id, paid, mkt, notes) =>
+              void handleUpdateItemDetails(id, paid, mkt, notes)
+            }
+            onRemoveItem={(id) => void handleRemoveItem(id)}
             onOpenItemDetail={handleOpenCollectionItemDetail}
-            onInspectInComparator={handleSelectForComparison}
-            onRefreshValuations={() => void handleRefreshValuations()}
-            onBulkImportLines={(lines) => void handleBulkAddToCollection(lines, activeCollectionId)}
+            onBulkImportLines={(lines) =>
+              void handleBulkAddToCollection(lines, activeCollectionId)
+            }
             onQuickAddManual={(minifig, condition, qty, paid, market, notes) =>
-              void handleAddToCollectionFromComparator({
+              void handleAddToCollectionFromAny({
                 collectionId: activeCollectionId,
                 minifig,
                 condition,
@@ -515,63 +497,183 @@ export function App() {
             }
           />
         )}
+
+        {activeTab === 'catalog' && (
+          <CatalogExploreView
+            collections={collections}
+            activeCollectionId={activeCollectionId}
+            preferredPriceSource={preferredPriceSource}
+            onOpenMinifigDetail={handleOpenMinifigDetail}
+            onQuickAdd={async (minifig, cond, qty, targetColId) => {
+              const report = generatePriceComparisonReport(minifig, cond, preferredPriceSource);
+              await handleAddToCollectionFromAny({
+                collectionId: targetColId,
+                minifig,
+                condition: cond,
+                quantity: qty,
+                purchasePriceEur: Math.round(report.estimatedMarketValueEur * 0.8 * 100) / 100,
+                estimatedUnitValueEur: report.estimatedMarketValueEur,
+                notes: 'Añadida desde Catálogo'
+              });
+            }}
+          />
+        )}
       </main>
 
-      <nav className="pwa-bottom-nav" aria-label="Navegación principal">
-        <button
-          type="button"
-          id="nav-tab-scanner"
-          className={`bottom-nav-item ${activeTab === 'scanner' ? 'active' : ''}`}
-          onClick={() => setActiveTab('scanner')}
-        >
-          <Camera size={20} />
-          <span>Escanear</span>
-        </button>
+      {/* Barra inferior flotante tipo cápsula + Botón central Brick Vermilion de cámara (estilo vídeo) */}
+      <nav className="bm-floating-dock" aria-label="Navegación principal">
+        <div className="bm-dock-capsule">
+          <button
+            type="button"
+            id="nav-tab-home"
+            className={`bm-dock-btn ${activeTab === 'home' ? 'active' : ''}`}
+            onClick={() => setActiveTab('home')}
+            aria-label="Inicio"
+            title="Inicio"
+          >
+            <Home size={21} strokeWidth={activeTab === 'home' ? 2.4 : 1.9} />
+          </button>
+
+          <button
+            type="button"
+            id="nav-tab-market"
+            className={`bm-dock-btn ${activeTab === 'market' ? 'active' : ''}`}
+            onClick={() => setActiveTab('market')}
+            aria-label="Tasar y vender"
+            title="Tasar y 5 portales"
+          >
+            <Tag size={20} strokeWidth={activeTab === 'market' ? 2.4 : 1.9} />
+          </button>
+        </div>
 
         <button
           type="button"
-          id="nav-tab-comparator"
-          className={`bottom-nav-item ${activeTab === 'comparator' ? 'active' : ''}`}
-          onClick={() => setActiveTab('comparator')}
+          id="nav-btn-camera"
+          className="bm-camera-fab"
+          onClick={() => setScannerOpen(true)}
+          aria-label="Abrir escáner de cámara"
+          title="Escanear minifiguras o piezas"
         >
-          <BarChart3 size={20} />
-          <span>Tasar</span>
+          <Camera size={24} strokeWidth={2.2} />
         </button>
 
-        <button
-          type="button"
-          id="nav-tab-collection"
-          className={`bottom-nav-item ${activeTab === 'collection' ? 'active' : ''}`}
-          onClick={() => setActiveTab('collection')}
-        >
-          <div className="nav-icon-wrap">
-            <Layers size={20} />
-            <span className="nav-badge">{portfolioStats.totalUnits}</span>
-          </div>
-          <span>Colecciones</span>
-        </button>
+        <div className="bm-dock-capsule">
+          <button
+            type="button"
+            id="nav-tab-collection"
+            className={`bm-dock-btn ${activeTab === 'collection' ? 'active' : ''}`}
+            onClick={() => setActiveTab('collection')}
+            aria-label="Colecciones"
+            title="Mis Colecciones"
+          >
+            <Box size={21} strokeWidth={activeTab === 'collection' ? 2.4 : 1.9} />
+          </button>
+
+          <button
+            type="button"
+            id="nav-tab-catalog"
+            className={`bm-dock-btn ${activeTab === 'catalog' ? 'active' : ''}`}
+            onClick={() => setActiveTab('catalog')}
+            aria-label="Catálogo"
+            title="Explorar catálogo"
+          >
+            <Search size={20} strokeWidth={activeTab === 'catalog' ? 2.4 : 1.9} />
+          </button>
+        </div>
       </nav>
 
-      {/* Bottom-Sheet Global de Detalle y Despiece Interactivo */}
+      {/* Menú lateral ☰ */}
+      <SideDrawer
+        open={drawerOpen}
+        themeMode={themeMode}
+        hasDemoCollection={hasDemoCollection}
+        onClose={() => setDrawerOpen(false)}
+        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenCmfScanner={() => setCmfOpen(true)}
+        onOpenImport={() => {
+          setActiveTab('collection');
+          setCollectionModalTrigger('import');
+        }}
+        onOpenExport={() => {
+          setActiveTab('collection');
+          setCollectionModalTrigger('export');
+        }}
+        onToggleTheme={() => void handleToggleTheme()}
+        onRestoreDemoCollection={() => void handleRestoreDemoCollection()}
+      />
+
+      {/* Escáner de cámara a pantalla completa */}
+      <CameraScanner
+        open={scannerOpen}
+        preferredPriceSource={preferredPriceSource}
+        defaultTargetMarginPct={appSettings.defaultTargetMarginPct}
+        collections={collections}
+        activeCollectionId={activeCollectionId}
+        onClose={() => setScannerOpen(false)}
+        onSelectCollection={(id) => void handleSelectCollection(id)}
+        onOpenMinifigDetail={handleOpenMinifigDetail}
+        onQuickAddToCollection={handleQuickAddFromScanner}
+        onBulkAddToCollection={handleBulkAddToCollection}
+        onScanSavedCelebration={(payload) => void handleScanSavedCelebration(payload)}
+      />
+
+      {/* Pantalla blanca de celebración al guardar un escaneo */}
+      <ScanCelebrationModal
+        payload={celebration}
+        onClose={() => {
+          setCelebration(null);
+          setActiveTab('collection');
+        }}
+        onScanMore={() => {
+          setCelebration(null);
+          setScannerOpen(true);
+        }}
+      />
+
+      {/* Escáner de cajas sorpresa CMF */}
+      <CmfScannerModal
+        open={cmfOpen}
+        preferredPriceSource={preferredPriceSource}
+        onClose={() => setCmfOpen(false)}
+        onOpenMinifigDetail={handleOpenMinifigDetail}
+        onQuickAdd={async (fig, cond, qty, priceEur) => {
+          await handleAddToCollectionFromAny({
+            collectionId: activeCollectionId,
+            minifig: fig,
+            condition: cond,
+            quantity: qty,
+            purchasePriceEur: Math.round(priceEur * 0.8 * 100) / 100,
+            estimatedUnitValueEur: priceEur,
+            notes: 'Identificada desde caja CMF'
+          });
+        }}
+      />
+
+      {/* Ficha completa blanca deslizante (Detalle, Fuente de Precio + 5 Portales, Despiece interactivo) */}
       <MinifigDetailSheet
         open={detailModal.open}
         minifig={activeDetailCollectionItem?.minifig ?? detailModal.minifig}
         collectionItem={activeDetailCollectionItem}
+        allItems={allItems}
         initialCondition={detailModal.condition}
+        initialExpandParts={detailModal.expandParts}
         preferredPriceSource={preferredPriceSource}
         collections={collections}
         activeCollectionId={activeCollectionId}
         onClose={handleCloseDetailSheet}
+        onChangePreferredSource={(src) => void handleChangePreferredSource(src)}
         onUpdateCollectionItemMissingParts={handleUpdateCollectionItemMissingParts}
         onUpdateCollectionItemDetails={handleUpdateItemDetails}
-        onAddNewToCollection={handleAddToCollectionFromComparator}
+        onAddNewToCollection={handleAddToCollectionFromAny}
       />
 
-      {/* Bottom-Sheet de Ajustes, Diagnóstico de APIs y Backup JSON */}
+      {/* Ajustes, APIs en vivo, Modo Oscuro opcional y Backup JSON */}
       <SettingsSheet
         open={settingsOpen}
         settings={appSettings}
-        onClose={handleCloseSettingsSheet}
+        themeMode={themeMode}
+        onToggleTheme={() => void handleToggleTheme()}
+        onClose={() => setSettingsOpen(false)}
         onSettingsChange={setAppSettings}
         onBackupRestored={handleBackupRestored}
       />

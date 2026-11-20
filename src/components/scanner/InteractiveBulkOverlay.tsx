@@ -6,6 +6,7 @@ interface InteractiveBulkOverlayProps {
   imageUrl: string;
   aspectRatio?: number;
   items: BulkScanDetectedItem[];
+  priceByBoxId?: Record<string, number>;
   selectedBoxId: string | null;
   onSelectBox: (boxId: string | null) => void;
   onUpdateBoxRect: (boxId: string, rect: NormalizedBoundingBox) => void;
@@ -47,6 +48,7 @@ export const InteractiveBulkOverlay: React.FC<InteractiveBulkOverlayProps> = ({
   imageUrl,
   aspectRatio = 1.5,
   items,
+  priceByBoxId,
   selectedBoxId,
   onSelectBox,
   onUpdateBoxRect,
@@ -275,7 +277,13 @@ export const InteractiveBulkOverlay: React.FC<InteractiveBulkOverlayProps> = ({
               onPointerDown={(e) => handleBoxPointerDown(e, item, 'move')}
             >
               <span className="bulk-box-badge mono">
-                {isScanning ? <Loader2 size={10} className="spin" /> : `#${item.slotIndex}`}
+                {isScanning ? (
+                  <Loader2 size={10} className="spin" />
+                ) : !isNoMatch && priceByBoxId && priceByBoxId[boxId] ? (
+                  `€${priceByBoxId[boxId].toFixed(2)}`
+                ) : (
+                  `#${item.slotIndex}`
+                )}
               </span>
 
               {isSelected && (

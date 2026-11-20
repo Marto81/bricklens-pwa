@@ -12,8 +12,8 @@ export default defineConfig({
         short_name: 'BrickLens',
         description:
           'Escanea minifiguras de LEGO con la cámara, compara precios en BrickLink, BrickOwl, eBay, Wallapop y Vinted, y calcula el valor total de tu colección.',
-        theme_color: '#101216',
-        background_color: '#101216',
+        theme_color: '#ffffff',
+        background_color: '#ffffff',
         display: 'standalone',
         orientation: 'portrait',
         icons: [

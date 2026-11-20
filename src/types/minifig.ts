@@ -283,11 +283,13 @@ export interface AppSettings {
   proxyBaseUrl: string;
   defaultTargetMarginPct: number;
   preferredPriceSource: PreferredPriceSource;
+  themeMode?: 'light' | 'dark';
 }
 
 export interface UserCollection {
   id: string;
   name: string;
+  color?: string;
   isDemo?: boolean;
   createdAtIso: string;
   updatedAtIso: string;

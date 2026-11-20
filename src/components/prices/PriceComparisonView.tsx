@@ -1,15 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
-  Check,
-  ChevronDown,
-  FolderPlus,
-  Loader2,
+  CheckCircle2,
+  ChevronRight,
   Plus,
-  PlusCircle,
-  Puzzle,
-  Search
+  Search,
+  Sparkles,
+  X
 } from 'lucide-react';
 import type {
+  CollectionItem,
   MinifigCondition,
   MinifigureMetadata,
   PreferredPriceSource,
@@ -18,16 +17,8 @@ import type {
 } from '../../types/minifig';
 import {
   ALL_MINIFIG_CATALOG,
-  createCustomMinifigMetadata,
-  findMinifigById,
-  searchMinifigCatalog
+  createCustomMinifigMetadata
 } from '../../data/catalogPresets';
-import { searchMinifigsHybrid } from '../../services/catalogService';
-import {
-  generatePriceComparisonReport,
-  getQuickDualPricesEur,
-  PREFERRED_PRICE_SOURCE_LABELS
-} from '../../services/priceAggregator';
 import { PriceAverageCard } from '../shared/PriceAverageCard';
 
 interface PriceComparisonViewProps {
@@ -36,12 +27,13 @@ interface PriceComparisonViewProps {
   preferredPriceSource: PreferredPriceSource;
   collections: UserCollection[];
   activeCollectionId: string | null;
-  onSelectCollection: (id: string) => void;
+  allItems?: CollectionItem[];
+  onSelectCollection: (collectionId: string) => void;
   onCreateCollection: (name: string) => Promise<UserCollection>;
   onChangePreferredSource: (source: PreferredPriceSource) => void;
   onChangeMinifig: (minifig: MinifigureMetadata) => void;
   onChangeCondition: (condition: MinifigCondition) => void;
-  onOpenMinifigDetail: (minifig: MinifigureMetadata, condition: MinifigCondition) => void;
+  onOpenMinifigDetail: (minifig: MinifigureMetadata, condition?: MinifigCondition) => void;
   onAddToCollection: (params: {
     collectionId?: string | null;
     minifig: MinifigureMetadata;
@@ -50,7 +42,7 @@ interface PriceComparisonViewProps {
     purchasePriceEur: number;
     estimatedUnitValueEur: number;
     notes?: string;
-  }) => void;
+  }) => Promise<void>;
 }
 
 export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
@@ -59,417 +51,296 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
   preferredPriceSource,
   collections,
   activeCollectionId,
-  onSelectCollection,
-  onCreateCollection,
-  onChangePreferredSource,
+  allItems = [],
   onChangeMinifig,
   onChangeCondition,
   onOpenMinifigDetail,
   onAddToCollection
 }) => {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [hybridResults, setHybridResults] = useState<MinifigureMetadata[]>(ALL_MINIFIG_CATALOG);
-  const [searchingLive, setSearchingLive] = useState(false);
+  const [subTab, setSubTab] = useState<'inventory' | 'quote'>('inventory');
+  const [invSearch, setInvSearch] = useState('');
+  const [quoteSearch, setQuoteSearch] = useState('');
+  const [latestReport, setLatestReport] = useState<PriceComparisonReport | null>(null);
+  const [addedFeedback, setAddedFeedback] = useState(false);
 
-  const [quantityToAdd, setQuantityToAdd] = useState<number>(1);
-  const [purchasePriceInput, setPurchasePriceInput] = useState<string>('');
-  const [marketPriceInput, setMarketPriceInput] = useState<string>('');
-  const [notesInput, setNotesInput] = useState<string>('');
-  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const filteredInventory = useMemo(() => {
+    const q = invSearch.trim().toLowerCase();
+    if (!q) return allItems;
+    return allItems.filter(
+      (it) =>
+        it.minifig.name.toLowerCase().includes(q) ||
+        it.minifig.figId.toLowerCase().includes(q) ||
+        it.minifig.theme.toLowerCase().includes(q)
+    );
+  }, [allItems, invSearch]);
 
-  const [targetCollectionId, setTargetCollectionId] = useState<string | null>(activeCollectionId);
-  const [creatingCollectionMode, setCreatingCollectionMode] = useState(false);
-  const [newCollectionName, setNewCollectionName] = useState('');
+  const quoteMatches = useMemo(() => {
+    const q = quoteSearch.trim().toLowerCase();
+    if (!q) return ALL_MINIFIG_CATALOG.slice(0, 6);
+    return ALL_MINIFIG_CATALOG.filter(
+      (m) =>
+        m.figId.toLowerCase().includes(q) ||
+        m.name.toLowerCase().includes(q) ||
+        m.theme.toLowerCase().includes(q)
+    ).slice(0, 6);
+  }, [quoteSearch]);
 
-  const [activeReport, setActiveReport] = useState<PriceComparisonReport>(() =>
-    generatePriceComparisonReport(selectedMinifig, selectedCondition, preferredPriceSource)
-  );
-
-  useEffect(() => {
-    setTargetCollectionId(activeCollectionId);
-  }, [activeCollectionId]);
-
-  useEffect(() => {
-    const local = searchMinifigCatalog(searchQuery);
-    setHybridResults(local);
-
-    if (searchQuery.trim().length < 2) {
-      setSearchingLive(false);
-      return;
-    }
-
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      setSearchingLive(true);
-      try {
-        const res = await searchMinifigsHybrid(searchQuery);
-        if (!cancelled) setHybridResults(res.results);
-      } finally {
-        if (!cancelled) setSearchingLive(false);
-      }
-    }, 320);
-
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [searchQuery]);
-
-  const cleanTypedCode = useMemo(
-    () => searchQuery.trim().replace(/\s+/g, '').toLowerCase(),
-    [searchQuery]
-  );
-
-  const canQuoteCustomCode = useMemo(() => {
-    if (cleanTypedCode.length < 2) return false;
-    return !findMinifigById(cleanTypedCode);
-  }, [cleanTypedCode]);
-
-  const displayedPills = useMemo(() => {
-    const base = hybridResults.length > 0 ? hybridResults : ALL_MINIFIG_CATALOG;
-    const selectedAlreadyVisible = base.some((m) => m.figId === selectedMinifig.figId);
-    return (selectedAlreadyVisible ? base : [selectedMinifig, ...base]).slice(0, 18);
-  }, [hybridResults, selectedMinifig]);
-
-  useEffect(() => {
-    setMarketPriceInput(activeReport.estimatedMarketValueEur.toFixed(2));
-  }, [selectedMinifig.figId, selectedCondition, activeReport.estimatedMarketValueEur]);
-
-  const dualPrices = useMemo(
-    () => getQuickDualPricesEur(selectedMinifig, preferredPriceSource),
-    [selectedMinifig, preferredPriceSource]
-  );
-
-  const handleSelectCustomCode = (codeRaw: string) => {
-    const clean = codeRaw.trim().replace(/\s+/g, '');
+  const handleQuoteCustomCode = () => {
+    const clean = quoteSearch.trim();
     if (!clean) return;
-    const resolved = findMinifigById(clean) ?? createCustomMinifigMetadata({ figId: clean });
-    onChangeMinifig(resolved);
-    setSearchQuery('');
+    const exact = ALL_MINIFIG_CATALOG.find(
+      (m) => m.figId.toLowerCase() === clean.toLowerCase()
+    );
+    onChangeMinifig(exact ?? createCustomMinifigMetadata({ figId: clean }));
   };
 
-  const handleCreateTargetCollection = async (e?: React.SyntheticEvent) => {
-    e?.preventDefault();
-    const trimmed = newCollectionName.trim();
-    if (!trimmed) return;
-    const created = await onCreateCollection(trimmed);
-    setTargetCollectionId(created.id);
-    setNewCollectionName('');
-    setCreatingCollectionMode(false);
-  };
-
-  const resolvedMarketValueEur = useMemo(() => {
-    const parsed = Number(marketPriceInput.replace(',', '.'));
-    if (marketPriceInput.trim() !== '' && Number.isFinite(parsed) && parsed > 0) {
-      return Math.round(parsed * 100) / 100;
-    }
-    return activeReport.estimatedMarketValueEur;
-  }, [marketPriceInput, activeReport.estimatedMarketValueEur]);
-
-  const targetCollectionName = useMemo(() => {
-    const found = collections.find((c) => c.id === targetCollectionId) ?? collections[0];
-    return found ? found.name : 'Mi Colección';
-  }, [collections, targetCollectionId]);
-
-  const handleConfirmAdd = (e: React.FormEvent) => {
-    e.preventDefault();
-    const parsedPurchase =
-      purchasePriceInput.trim() !== ''
-        ? Math.max(0, Number(purchasePriceInput.replace(',', '.')) || 0)
-        : Math.round(resolvedMarketValueEur * 0.8 * 100) / 100;
-
-    const updatedMinifig: MinifigureMetadata =
-      Math.abs(resolvedMarketValueEur - activeReport.estimatedMarketValueEur) > 0.01
-        ? {
-            ...selectedMinifig,
-            baseMarketPriceEur: {
-              ...selectedMinifig.baseMarketPriceEur,
-              [selectedCondition]: resolvedMarketValueEur
-            },
-            isEstimatedFallbackPrice: false
-          }
-        : selectedMinifig;
-
-    onAddToCollection({
-      collectionId: targetCollectionId,
-      minifig: updatedMinifig,
+  const handleQuickAddQuoted = async () => {
+    const val =
+      latestReport?.estimatedMarketValueEur ??
+      selectedMinifig.baseMarketPriceEur[selectedCondition];
+    await onAddToCollection({
+      collectionId: activeCollectionId ?? collections[0]?.id ?? null,
+      minifig: selectedMinifig,
       condition: selectedCondition,
-      quantity: Math.max(1, quantityToAdd),
-      purchasePriceEur: Math.round(parsedPurchase * 100) / 100,
-      estimatedUnitValueEur: resolvedMarketValueEur,
-      notes: notesInput.trim() || undefined
+      quantity: 1,
+      purchasePriceEur: Math.round(val * 0.8 * 100) / 100,
+      estimatedUnitValueEur: val,
+      notes: 'Añadida desde Tasador 5 Portales'
     });
-
-    onChangeMinifig(updatedMinifig);
-    setSavedNotice(`Guardada en «${targetCollectionName}»`);
-    setNotesInput('');
-    window.setTimeout(() => setSavedNotice(null), 2600);
+    setAddedFeedback(true);
+    setTimeout(() => setAddedFeedback(false), 1800);
   };
 
   return (
-    <section className="screen-stack" aria-label="Tasar y buscar minifiguras">
-      {/* Buscador Universal (Catálogo local + Rebrickable + Código BrickLink) */}
-      <div className="surface-card">
-        <form
-          className="search-bar-wrap"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (hybridResults.length === 1) {
-              onChangeMinifig(hybridResults[0]);
-            } else if (canQuoteCustomCode) {
-              handleSelectCustomCode(cleanTypedCode);
-            }
-          }}
-        >
-          <Search size={16} className="search-bar-icon" />
-          <input
-            type="search"
-            id="comparator-search-input"
-            className="search-input"
-            placeholder="Busca figura o código BrickLink (ej. sw0999, vader)..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-          />
-          {searchingLive && <Loader2 size={14} className="spin search-bar-spinner" />}
-        </form>
-
-        <div className="catalog-pills-scroll" role="list">
-          {canQuoteCustomCode && (
-            <button
-              type="button"
-              id="btn-quote-custom-code"
-              className="catalog-pill active"
-              onClick={() => handleSelectCustomCode(cleanTypedCode)}
-            >
-              <Plus size={12} />
-              <span>Cotizar «{cleanTypedCode.toUpperCase()}»</span>
-            </button>
-          )}
-          {displayedPills.map((item) => (
-            <button
-              key={item.figId}
-              type="button"
-              id={`comp-select-${item.figId}`}
-              className={`catalog-pill ${item.figId === selectedMinifig.figId ? 'active' : ''}`}
-              onClick={() => onChangeMinifig(item)}
-            >
-              <span className="mono">{item.figId.toUpperCase()}</span>
-              <span>{item.name.split('—')[0].split('(')[0].trim()}</span>
-            </button>
-          ))}
+    <div className="bm-screen" id="market-sell-screen">
+      {/* Cabecera estilo vídeo 01:52: Inventario | Tasar 5 Portales */}
+      <header className="bm-market-head">
+        <div className="bm-segmented full" role="tablist">
+          <button
+            type="button"
+            id="market-tab-inventory"
+            className={subTab === 'inventory' ? 'active' : ''}
+            onClick={() => setSubTab('inventory')}
+          >
+            Inventario ({allItems.length})
+          </button>
+          <button
+            type="button"
+            id="market-tab-quote"
+            className={subTab === 'quote' ? 'active' : ''}
+            onClick={() => setSubTab('quote')}
+          >
+            Tasar 5 Portales
+          </button>
         </div>
-      </div>
+      </header>
 
-      {/* Tarjeta Principal: Identidad + Estado + Media Desplegable */}
-      <div className="surface-card">
-        <div className="comp-fig-header">
-          <img
-            src={selectedMinifig.imageUrl}
-            alt={selectedMinifig.name}
-            className="comp-fig-avatar"
-          />
-          <div className="comp-fig-meta">
-            <div className="fig-id-row">
-              <span className="fig-code-badge mono">{selectedMinifig.figId.toUpperCase()}</span>
-              <span className="fig-theme-label">{selectedMinifig.theme}</span>
-              <span className="fig-year-label">· {selectedMinifig.yearReleased}</span>
+      {subTab === 'inventory' ? (
+        <>
+          <div className="bm-search-row">
+            <div className="bm-search-input-wrap">
+              <Search size={15} className="bm-search-icon" />
+              <input
+                id="market-inv-search"
+                type="text"
+                value={invSearch}
+                onChange={(e) => setInvSearch(e.target.value)}
+                placeholder="Buscar en tu inventario..."
+              />
+              {invSearch && (
+                <button
+                  type="button"
+                  className="bm-clear-btn"
+                  onClick={() => setInvSearch('')}
+                >
+                  <X size={14} />
+                </button>
+              )}
             </div>
-            <h2 className="comp-fig-title">{selectedMinifig.name}</h2>
+          </div>
+
+          <div className="bm-table-header">
+            <span>FIGURA</span>
+            <span>PRECIO UE</span>
+          </div>
+
+          {filteredInventory.length === 0 ? (
+            <div className="bm-empty-inline">
+              <p>No hay figuras en tu inventario todavía.</p>
+              <button
+                type="button"
+                className="bm-btn-primary sm"
+                onClick={() => setSubTab('quote')}
+              >
+                Tasar cualquier código
+              </button>
+            </div>
+          ) : (
+            <div className="bm-sell-list">
+              {filteredInventory.map((item) => {
+                const condTxt =
+                  item.condition === 'new'
+                    ? 'Nueva'
+                    : item.condition === 'used_incomplete'
+                    ? 'Incompleta'
+                    : 'Usada';
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    id={`sell-row-${item.minifig.figId}`}
+                    className="bm-sell-row"
+                    onClick={() => {
+                      onChangeMinifig(item.minifig);
+                      onChangeCondition(item.condition);
+                      setSubTab('quote');
+                    }}
+                  >
+                    <img
+                      src={item.minifig.imageUrl}
+                      alt={item.minifig.name}
+                      className="bm-thumb-sm"
+                    />
+                    <div className="bm-row-text-stack">
+                      <span className="bm-row-title truncate">{item.minifig.name}</span>
+                      <span className="bm-row-sub">
+                        {item.quantity}x · {item.minifig.figId} · {condTxt}
+                      </span>
+                    </div>
+                    <strong className="bm-sell-price">
+                      €{(item.estimatedUnitValueEur * item.quantity).toFixed(2)}
+                    </strong>
+                    <span className="bm-sell-cta">
+                      Tasar <ChevronRight size={14} />
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="bm-quote-stack">
+          <div className="bm-search-row">
+            <div className="bm-search-input-wrap">
+              <Search size={15} className="bm-search-icon" />
+              <input
+                id="comparator-search-input"
+                type="text"
+                value={quoteSearch}
+                onChange={(e) => setQuoteSearch(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleQuoteCustomCode();
+                  }
+                }}
+                placeholder="Código BrickLink o nombre (ej. sw0999)..."
+              />
+              {quoteSearch && (
+                <button
+                  type="button"
+                  className="bm-clear-btn"
+                  onClick={() => setQuoteSearch('')}
+                >
+                  <X size={14} />
+                </button>
+              )}
+            </div>
+            {quoteSearch.trim() && (
+              <button
+                type="button"
+                id="btn-quote-custom-code"
+                className="bm-btn-primary sm"
+                onClick={handleQuoteCustomCode}
+              >
+                <Sparkles size={13} /> Cotizar
+              </button>
+            )}
+          </div>
+
+          <div className="bm-theme-chip-strip">
+            {quoteMatches.map((m) => (
+              <button
+                key={m.figId}
+                type="button"
+                className={`bm-theme-chip ${selectedMinifig.figId === m.figId ? 'active' : ''}`}
+                onClick={() => onChangeMinifig(m)}
+              >
+                {m.figId.toUpperCase()} · {m.name.split(' ')[0]}
+              </button>
+            ))}
+          </div>
+
+          {/* Cabecera limpia de figura tasada */}
+          <div className="bm-quote-hero-card">
             <button
               type="button"
-              id="btn-open-detail-from-comparator"
-              className="inline-parts-link"
+              className="bm-quote-hero-top"
               onClick={() => onOpenMinifigDetail(selectedMinifig, selectedCondition)}
             >
-              <Puzzle size={13} />
-              <span>Ver despiece ({selectedMinifig.parts.length} piezas) y faltantes →</span>
+              <img
+                src={selectedMinifig.imageUrl}
+                alt={selectedMinifig.name}
+                className="bm-thumb-md"
+              />
+              <div className="bm-row-text-stack">
+                <strong className="bm-row-title truncate">{selectedMinifig.name}</strong>
+                <span className="bm-row-sub">
+                  {selectedMinifig.figId} · {selectedMinifig.theme} · {selectedMinifig.yearReleased}
+                </span>
+              </div>
+              <ChevronRight size={16} className="muted-icon" />
             </button>
+
+            <div className="bm-segmented full">
+              {(
+                [
+                  { id: 'new', label: 'Nueva' },
+                  { id: 'used_complete', label: 'Usada' },
+                  { id: 'used_incomplete', label: 'Incompleta' }
+                ] as const
+              ).map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  id={`comp-cond-${c.id}`}
+                  className={selectedCondition === c.id ? 'active' : ''}
+                  onClick={() => onChangeCondition(c.id)}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
 
-        {/* Selector de condición */}
-        <div className="condition-segmented-grid" style={{ marginTop: '14px' }}>
-          {(
-            [
-              { id: 'new', label: 'Nueva', eur: dualPrices.newEur },
-              { id: 'used_complete', label: 'Usada Completa', eur: dualPrices.usedEur },
-              { id: 'used_incomplete', label: 'Incompleta', eur: dualPrices.incompleteEur }
-            ] as const
-          ).map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              id={`comp-cond-${item.id}`}
-              className={`condition-segment ${selectedCondition === item.id ? 'active' : ''}`}
-              onClick={() => onChangeCondition(item.id)}
-            >
-              <span>{item.label}</span>
-              <strong className="mono">{item.eur.toFixed(2)} €</strong>
-            </button>
-          ))}
-        </div>
-
-        {/* Media de mercado + desglose desplegable de los 5 portales */}
-        <div style={{ marginTop: '14px' }}>
+          {/* Comparador 5 portales EU (BrickLink, BrickOwl, eBay, Wallapop, Vinted) */}
           <PriceAverageCard
             minifig={selectedMinifig}
             condition={selectedCondition}
             preferredPriceSource={preferredPriceSource}
-            onReportChange={setActiveReport}
+            defaultExpanded={false}
+            onReportChange={setLatestReport}
           />
-        </div>
-
-        {/* Fuente preferida compacta */}
-        <div className="preferred-source-bar" style={{ marginTop: '12px' }}>
-          <label htmlFor="preferred-price-source-select" className="eyebrow">
-            Cálculo de media
-          </label>
-          <div className="select-wrap">
-            <select
-              id="preferred-price-source-select"
-              className="compact-select"
-              value={preferredPriceSource}
-              onChange={(e) => onChangePreferredSource(e.target.value as PreferredPriceSource)}
-            >
-              {(Object.keys(PREFERRED_PRICE_SOURCE_LABELS) as PreferredPriceSource[]).map((src) => (
-                <option key={src} value={src}>
-                  {PREFERRED_PRICE_SOURCE_LABELS[src]}
-                </option>
-              ))}
-            </select>
-            <ChevronDown size={14} className="select-chevron" />
-          </div>
-        </div>
-      </div>
-
-      {/* Guardar directamente en colección */}
-      <form className="surface-card comp-add-form" onSubmit={handleConfirmAdd}>
-        <div className="target-collection-row">
-          <div className="target-col-select-wrap">
-            <label htmlFor="comp-target-collection">Guardar en colección</label>
-            <select
-              id="comp-target-collection"
-              className="compact-select"
-              value={targetCollectionId ?? ''}
-              onChange={(e) => {
-                setTargetCollectionId(e.target.value);
-                onSelectCollection(e.target.value);
-              }}
-            >
-              {collections.length === 0 ? (
-                <option value="">Mi Colección (nueva)</option>
-              ) : (
-                collections.map((col) => (
-                  <option key={col.id} value={col.id}>
-                    {col.name}
-                  </option>
-                ))
-              )}
-            </select>
-          </div>
 
           <button
             type="button"
-            className="btn-secondary-inline"
-            onClick={() => setCreatingCollectionMode((v) => !v)}
-            title="Crear nueva colección"
+            id="btn-comp-add-collection"
+            className="bm-btn-primary full"
+            onClick={() => void handleQuickAddQuoted()}
           >
-            <FolderPlus size={14} /> Nueva
+            {addedFeedback ? (
+              <>
+                <CheckCircle2 size={16} /> Añadida a tu colección
+              </>
+            ) : (
+              <>
+                <Plus size={16} /> Añadir a mi colección
+              </>
+            )}
           </button>
         </div>
-
-        {creatingCollectionMode && (
-          <div className="inline-new-col-form">
-            <input
-              type="text"
-              className="text-input"
-              placeholder="Ej. Star Wars, Vitrina..."
-              value={newCollectionName}
-              onChange={(e) => setNewCollectionName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  void handleCreateTargetCollection(e);
-                }
-              }}
-            />
-            <button
-              type="button"
-              className="btn-primary-inline"
-              onClick={(e) => void handleCreateTargetCollection(e)}
-            >
-              Crear
-            </button>
-          </div>
-        )}
-
-        <div className="comp-add-grid three-cols">
-          <div className="sheet-field">
-            <label htmlFor="comp-qty-input">Uds.</label>
-            <input
-              id="comp-qty-input"
-              type="number"
-              min={1}
-              max={999}
-              className="text-input mono"
-              value={quantityToAdd}
-              onChange={(e) => setQuantityToAdd(Math.max(1, Number(e.target.value) || 1))}
-            />
-          </div>
-
-          <div className="sheet-field">
-            <label htmlFor="comp-paid-input">Pagado (€)</label>
-            <input
-              id="comp-paid-input"
-              type="number"
-              step="0.5"
-              min="0"
-              className="text-input mono"
-              placeholder={(resolvedMarketValueEur * 0.8).toFixed(2)}
-              value={purchasePriceInput}
-              onChange={(e) => setPurchasePriceInput(e.target.value)}
-            />
-          </div>
-
-          <div className="sheet-field">
-            <label htmlFor="comp-market-input">Valor (€)</label>
-            <input
-              id="comp-market-input"
-              type="number"
-              step="0.5"
-              min="0.5"
-              className="text-input mono"
-              value={marketPriceInput}
-              onChange={(e) => setMarketPriceInput(e.target.value)}
-            />
-          </div>
-        </div>
-
-        <div className="sheet-field">
-          <label htmlFor="comp-notes-input">Notas opcionales</label>
-          <input
-            id="comp-notes-input"
-            type="text"
-            className="text-input"
-            placeholder="Ej. Comprada en Wallapop, estado 9/10..."
-            value={notesInput}
-            onChange={(e) => setNotesInput(e.target.value)}
-          />
-        </div>
-
-        <button type="submit" id="btn-comp-add-collection" className="btn-primary full-width">
-          {savedNotice ? (
-            <>
-              <Check size={16} /> {savedNotice}
-            </>
-          ) : (
-            <>
-              <PlusCircle size={16} /> Guardar en «{targetCollectionName}» (
-              {(resolvedMarketValueEur * quantityToAdd).toFixed(2)} €)
-            </>
-          )}
-        </button>
-      </form>
-    </section>
+      )}
+    </div>
   );
 };

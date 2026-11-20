@@ -29,6 +29,16 @@ import {
 
 export const DEMO_COLLECTION_ID = 'col-demo';
 export const DEFAULT_USER_COLLECTION_NAME = 'Mi Colección';
+export const COLLECTION_DOT_COLORS = [
+  '#D94121',
+  '#F97316',
+  '#22C55E',
+  '#14B8A6',
+  '#0EA5E9',
+  '#6366F1',
+  '#A855F7',
+  '#EC4899'
+] as const;
 
 interface AppMetaRow {
   key: string;
@@ -245,6 +255,7 @@ export async function initializeCollections(): Promise<{
     const demoCollection: UserCollection = {
       id: DEMO_COLLECTION_ID,
       name: 'Colección de prueba',
+      color: '#22C55E',
       isDemo: true,
       createdAtIso: now,
       updatedAtIso: now
@@ -289,13 +300,18 @@ export async function setActiveCollectionId(collectionId: string | null): Promis
 
 export async function createCollection(
   name: string,
-  options?: { isDemo?: boolean; id?: string }
+  options?: { isDemo?: boolean; id?: string; color?: string }
 ): Promise<UserCollection> {
   const cleanName = name.trim() || DEFAULT_USER_COLLECTION_NAME;
   const now = new Date().toISOString();
+  const existingCount = await db.collections.count();
+  const fallbackColor =
+    options?.color ||
+    COLLECTION_DOT_COLORS[existingCount % COLLECTION_DOT_COLORS.length];
   const created: UserCollection = {
     id: options?.id || `col-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
     name: cleanName,
+    color: fallbackColor,
     isDemo: options?.isDemo,
     createdAtIso: now,
     updatedAtIso: now
@@ -341,6 +357,7 @@ export async function restoreDemoCollection(): Promise<{
   const demoCollection: UserCollection = {
     id: DEMO_COLLECTION_ID,
     name: 'Colección de prueba',
+    color: '#22C55E',
     isDemo: true,
     createdAtIso: now,
     updatedAtIso: now
@@ -965,7 +982,8 @@ export async function getObservedPricesForFig(
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   proxyBaseUrl: '',
   defaultTargetMarginPct: 35,
-  preferredPriceSource: 'weighted'
+  preferredPriceSource: 'weighted',
+  themeMode: 'light'
 };
 
 export async function getAppSettings(): Promise<AppSettings> {
@@ -981,7 +999,8 @@ export async function getAppSettings(): Promise<AppSettings> {
         parsed.defaultTargetMarginPct <= 75
           ? parsed.defaultTargetMarginPct
           : 35,
-      preferredPriceSource: parsed.preferredPriceSource || 'weighted'
+      preferredPriceSource: parsed.preferredPriceSource || 'weighted',
+      themeMode: parsed.themeMode === 'dark' ? 'dark' : 'light'
     };
   } catch {
     return { ...DEFAULT_APP_SETTINGS };

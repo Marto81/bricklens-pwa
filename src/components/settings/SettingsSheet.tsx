@@ -22,6 +22,8 @@ import { storageRepository } from '../../services/storageRepository';
 interface SettingsSheetProps {
   open: boolean;
   settings: AppSettings;
+  themeMode?: 'light' | 'dark';
+  onToggleTheme?: () => void;
   onClose: () => void;
   onSettingsChange: (next: AppSettings) => void;
   onBackupRestored: (nextActiveCollectionId: string | null) => Promise<void>;
@@ -30,6 +32,8 @@ interface SettingsSheetProps {
 export const SettingsSheet: React.FC<SettingsSheetProps> = ({
   open,
   settings,
+  themeMode = 'light',
+  onToggleTheme,
   onClose,
   onSettingsChange,
   onBackupRestored
@@ -143,7 +147,7 @@ export const SettingsSheet: React.FC<SettingsSheetProps> = ({
 
         <div className="sheet-header compact">
           <div>
-            <span className="eyebrow">BrickLens v2.0</span>
+            <span className="eyebrow">BrickLens</span>
             <h2 className="sheet-title">Ajustes, APIs y Backup</h2>
           </div>
           <button
@@ -162,6 +166,29 @@ export const SettingsSheet: React.FC<SettingsSheetProps> = ({
             <div className={`settings-feedback ${feedback.type}`}>
               <CheckCircle2 size={14} /> {feedback.text}
             </div>
+          )}
+
+          {onToggleTheme && (
+            <section className="sheet-section">
+              <div className="bm-switch-row compact">
+                <div>
+                  <strong>Modo oscuro</strong>
+                  <p className="sheet-section-sub">
+                    Claro minimalista por defecto · cambia a oscuro si prefieres
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  id="btn-settings-toggle-theme"
+                  role="switch"
+                  aria-checked={themeMode === 'dark'}
+                  className={`bm-switch ${themeMode === 'dark' ? 'on' : ''}`}
+                  onClick={onToggleTheme}
+                >
+                  <span />
+                </button>
+              </div>
+            </section>
           )}
 
           {/* Estado de APIs en vivo */}
