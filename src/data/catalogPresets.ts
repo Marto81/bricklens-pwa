@@ -1,4 +1,5 @@
 import type { MinifigureMetadata } from '../types/minifig';
+import { lookupSeedPrice } from './minifigPriceSeeds';
 
 export function makeMinimalFigAvatar(code: string, bg: string, fg: string, accent: string): string {
   const safeCode = code.toUpperCase();
@@ -23,30 +24,30 @@ export const MINIFIG_CATALOG: MinifigureMetadata[] = [
   {
     figId: 'sw0002',
     rebrickableId: 'fig-003681',
-    name: 'Boba Fett — Cloud City (Brazos y Piernas Impresas)',
+    name: 'Boba Fett — Classic Grays (7144 Slave I)',
     theme: 'Star Wars',
-    subtheme: 'Original Trilogy / Cloud City',
-    yearReleased: 2003,
+    subtheme: 'Original Trilogy (Classic)',
+    yearReleased: 2000,
     numParts: 4,
-    rarity: 'grail',
+    rarity: 'rare',
     imageUrl: '/samples/sw0002.jpg',
-    appearsInSets: 1,
-    sampleSetCode: '10123-1 (Cloud City)',
+    appearsInSets: 3,
+    sampleSetCode: '7144-1 (Slave I)',
     distinguishingFeatures: [
-      'Serigrafía táctica en ambos brazos y piernas (exclusivo set 10123)',
-      'Casco molde clásico verde arena integrado con jetpack',
-      'Cinturón impreso en cadera negra'
+      'Casco + Jetpack moldeado de una pieza en Old Light Gray',
+      'Torso con emblema Mandaloriano clásico sin brazos impresos',
+      'Piernas Old Dark Gray de primera generación Star Wars'
     ],
     parts: [
-      { partNum: '30124pb01', name: 'Casco + Jetpack Integrado Sand Green', category: 'headgear', avgPriceEur: 285.0 },
-      { partNum: '3626bpx46', name: 'Cabeza Clásica Balaclava Negra', category: 'head', avgPriceEur: 14.5 },
-      { partNum: '973pb0308c01', name: 'Torso Armadura Mandaloriana con Brazos Impresos', category: 'torso', avgPriceEur: 920.0 },
-      { partNum: '970c00pb024', name: 'Piernas Impresas Cloud City con Cinturón', category: 'legs', avgPriceEur: 610.0 }
+      { partNum: '30124pb01', name: 'Casco + Jetpack Integrado Classic Gray', category: 'headgear', avgPriceEur: 22.0 },
+      { partNum: '3626bpx46', name: 'Cabeza Clásica Balaclava Negra', category: 'head', avgPriceEur: 3.5 },
+      { partNum: '973px50c01', name: 'Torso Armadura Mandaloriana Clásica', category: 'torso', avgPriceEur: 14.0 },
+      { partNum: '970c00', name: 'Piernas Old Dark Gray', category: 'legs', avgPriceEur: 4.5 }
     ],
     baseMarketPriceEur: {
-      new: 1980.0,
-      used_complete: 1490.0,
-      used_incomplete: 820.0
+      new: 108.0,
+      used_complete: 39.5,
+      used_incomplete: 22.0
     }
   },
   {
@@ -73,9 +74,9 @@ export const MINIFIG_CATALOG: MinifigureMetadata[] = [
       { partNum: '970c00pb0358', name: 'Piernas Blancas con Rodilleras', category: 'legs', avgPriceEur: 2.6 }
     ],
     baseMarketPriceEur: {
-      new: 11.4,
-      used_complete: 7.9,
-      used_incomplete: 4.5
+      new: 10.6,
+      used_complete: 5.5,
+      used_incomplete: 3.2
     }
   },
   {
@@ -564,6 +565,85 @@ export function guessThemeFromFigId(figId: string): string {
   return 'LEGO System';
 }
 
+function estimateSmartFallbackPrices(params: {
+  cleanId: string;
+  name?: string;
+  theme: string;
+}): { usedEur: number; newEur: number; yearReleased: number } {
+  const id = params.cleanId;
+  const hay = `${id} ${params.name || ''} ${params.theme}`.toLowerCase();
+  const numMatch = id.match(/\d+/);
+  const seqNum = numMatch ? Number(numMatch[0]) : 500;
+
+  let yearReleased = 2020;
+  let baseUsed = 6.8;
+
+  if (id.startsWith('sw')) {
+    if (seqNum < 150) {
+      yearReleased = 2003;
+      baseUsed = 14.5;
+    } else if (seqNum < 400) {
+      yearReleased = 2010;
+      baseUsed = 13.0;
+    } else if (seqNum < 700) {
+      yearReleased = 2014;
+      baseUsed = 9.2;
+    } else if (seqNum < 1000) {
+      yearReleased = 2017;
+      baseUsed = 8.4;
+    } else if (seqNum < 1200) {
+      yearReleased = 2021;
+      baseUsed = 8.9;
+    } else {
+      yearReleased = 2023;
+      baseUsed = 7.4;
+    }
+  } else if (id.startsWith('sh')) {
+    yearReleased = seqNum < 300 ? 2015 : seqNum < 650 ? 2019 : 2022;
+    baseUsed = seqNum < 300 ? 11.5 : 7.8;
+  } else if (id.startsWith('hp')) {
+    yearReleased = seqNum < 130 ? 2007 : 2020;
+    baseUsed = seqNum < 130 ? 10.5 : 5.8;
+  } else if (id.startsWith('njo')) {
+    yearReleased = seqNum < 250 ? 2014 : 2021;
+    baseUsed = seqNum < 250 ? 9.5 : 6.2;
+  } else if (id.startsWith('sp') || id.startsWith('cas') || id.startsWith('pir')) {
+    yearReleased = 1986;
+    baseUsed = 18.5;
+  } else if (id.startsWith('lor') || id.startsWith('lotr')) {
+    yearReleased = 2013;
+    baseUsed = 19.5;
+  } else if (id.startsWith('col') || id.startsWith('dnd')) {
+    yearReleased = 2024;
+    baseUsed = 6.4;
+  } else if (id.startsWith('cty')) {
+    yearReleased = 2021;
+    baseUsed = 3.4;
+  }
+
+  // Modificadores por personaje/tipo de figura (comandantes, jedi, sith vs tropas comunes)
+  if (/(rex|thrawn|revan|malgus|boba fett|jango|amidala|padme|ahsoka|armorer|ackbar|phasma|krennic|grievous|dooku|palpatine|vader|inquisitor|deadpool|wolverine|doom|balrog|sauron|aragorn)/.test(hay)) {
+    baseUsed *= 1.75;
+  } else if (/(battle droid|super battle droid|skeleton|citizen|worker|police|firefighter|driver|guard)/.test(hay)) {
+    baseUsed *= 0.55;
+  } else if (/(pauldron|kama|cloth|cape|printed arms|dual molded|beskar|jetpack)/.test(hay)) {
+    baseUsed *= 1.25;
+  }
+
+  // Variación determinista suave por código para evitar que dos figuras distintas tengan el mismo céntimo
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash << 5) - hash + id.charCodeAt(i);
+    hash |= 0;
+  }
+  const factor = 0.92 + ((Math.abs(hash) % 17) / 100);
+  const usedEur = Math.max(1.8, Math.round(baseUsed * factor * 100) / 100);
+  const newRatio = yearReleased <= 2012 ? 1.65 : yearReleased <= 2018 ? 1.42 : 1.28;
+  const newEur = Math.max(usedEur + 0.8, Math.round(usedEur * newRatio * 100) / 100);
+
+  return { usedEur, newEur, yearReleased };
+}
+
 export function createCustomMinifigMetadata(params: {
   figId: string;
   name?: string;
@@ -572,65 +652,79 @@ export function createCustomMinifigMetadata(params: {
   usedEur?: number;
   newEur?: number;
   incompleteEur?: number;
+  yearReleased?: number;
+  appearsInSets?: number;
   notes?: string;
 }): MinifigureMetadata {
   const existing = findMinifigById(params.figId);
   if (existing) return existing;
 
   const cleanId = params.figId.trim().toLowerCase() || 'custom';
+  const seed = lookupSeedPrice(cleanId);
+  const resolvedTheme = params.theme?.trim() || seed?.[3] || guessThemeFromFigId(cleanId);
+
+  const smart = estimateSmartFallbackPrices({
+    cleanId,
+    name: params.name,
+    theme: resolvedTheme
+  });
+
   const estUsed = Math.max(
     0.5,
-    Math.round((params.usedEur ?? 9.5) * 100) / 100
+    Math.round((params.usedEur ?? seed?.[0] ?? smart.usedEur) * 100) / 100
   );
   const estNew = Math.max(
     estUsed,
-    Math.round((params.newEur ?? estUsed * 1.42) * 100) / 100
+    Math.round((params.newEur ?? seed?.[1] ?? smart.newEur) * 100) / 100
   );
   const estIncomplete = Math.max(
     0.5,
-    Math.round((params.incompleteEur ?? estUsed * 0.56) * 100) / 100
+    Math.round((params.incompleteEur ?? estUsed * 0.58) * 100) / 100
   );
-  const resolvedTheme = params.theme?.trim() || guessThemeFromFigId(cleanId);
+  const resolvedYear = params.yearReleased ?? seed?.[2] ?? smart.yearReleased;
+  const resolvedSets = params.appearsInSets ?? seed?.[4] ?? 1;
 
   return {
     figId: cleanId,
     rebrickableId: `fig-${cleanId}`,
     name: params.name?.trim() || `Minifigura LEGO ${cleanId.toUpperCase()}`,
     theme: resolvedTheme,
-    yearReleased: 2020,
+    yearReleased: resolvedYear,
     numParts: 4,
     rarity: estUsed >= 35 ? 'rare' : estUsed >= 12 ? 'uncommon' : 'common',
     imageUrl: params.imageUrl || makeMinimalFigAvatar(cleanId, '#1b1f29', '#475569', '#fbbf24'),
-    appearsInSets: 1,
+    appearsInSets: resolvedSets,
     sampleSetCode: 'Catálogo BrickLink',
     distinguishingFeatures: [
       params.notes || `Referencia BrickLink ${cleanId.toUpperCase()}`,
-      'Cotización orientativa modificable según mercado real'
+      seed
+        ? 'Cotización verificada de catálogo europeo'
+        : 'Cotización estimada por serie y antigüedad'
     ],
     parts: [
       {
         partNum: `${cleanId}-hg`,
         name: 'Casco / Pelo / Sombrero',
         category: 'headgear',
-        avgPriceEur: Math.round(estUsed * 0.2 * 100) / 100
+        avgPriceEur: Math.round(estUsed * 0.22 * 100) / 100
       },
       {
         partNum: `${cleanId}-hd`,
         name: 'Cabeza Impresa',
         category: 'head',
-        avgPriceEur: Math.round(estUsed * 0.15 * 100) / 100
+        avgPriceEur: Math.round(estUsed * 0.16 * 100) / 100
       },
       {
         partNum: `${cleanId}-tr`,
         name: 'Torso Impreso',
         category: 'torso',
-        avgPriceEur: Math.round(estUsed * 0.4 * 100) / 100
+        avgPriceEur: Math.round(estUsed * 0.38 * 100) / 100
       },
       {
         partNum: `${cleanId}-lg`,
         name: 'Piernas / Cadera',
         category: 'legs',
-        avgPriceEur: Math.round(estUsed * 0.25 * 100) / 100
+        avgPriceEur: Math.round(estUsed * 0.24 * 100) / 100
       }
     ],
     partsSource: 'template',
@@ -639,7 +733,7 @@ export function createCustomMinifigMetadata(params: {
       used_complete: estUsed,
       used_incomplete: estIncomplete
     },
-    isEstimatedFallbackPrice: params.usedEur === undefined
+    isEstimatedFallbackPrice: params.usedEur === undefined && !seed
   };
 }
 

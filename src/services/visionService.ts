@@ -34,6 +34,8 @@ interface BrickognizeResponse {
     upper: number;
     right: number;
     lower: number;
+    image_width?: number;
+    image_height?: number;
     score?: number;
   };
   items?: BrickognizePredictionItem[];
@@ -148,7 +150,7 @@ export const encodeFullFrameToWebP = encodeFullFrameToJpeg;
 export async function cropNormalizedRegion(
   source: HTMLVideoElement | HTMLImageElement,
   box: NormalizedBox,
-  outputSize = 420
+  outputSize = 440
 ): Promise<{ blob: Blob; dataUrl: string }> {
   const { rawWidth, rawHeight } = resolveRawDimensions(source);
 
@@ -165,10 +167,11 @@ export async function cropNormalizedRegion(
     throw new Error('No se pudo crear recorte en canvas');
   }
 
-  ctx.fillStyle = '#12151c';
+  // Relleno neutro claro que no crea bordes artificiales con fondos de mesa claros
+  ctx.fillStyle = '#e5e7eb';
   ctx.fillRect(0, 0, outputSize, outputSize);
 
-  const fitScale = Math.min(outputSize / sw, outputSize / sh);
+  const fitScale = Math.min((outputSize * 0.92) / sw, (outputSize * 0.92) / sh);
   const dw = Math.round(sw * fitScale);
   const dh = Math.round(sh * fitScale);
   const dx = Math.round((outputSize - dw) / 2);
@@ -176,12 +179,15 @@ export async function cropNormalizedRegion(
 
   ctx.drawImage(source, sx, sy, sw, sh, dx, dy, dw, dh);
 
-  return encodeCanvasToJpeg(canvas, 0.86);
+  return encodeCanvasToJpeg(canvas, 0.88);
 }
 
 /**
- * Detecta zonas activas con minifiguras sobre un fondo relativamente uniforme mediante
- * energía de borde y contraste local en una rejilla ligera.
+ * Segmentador adaptativo de lotes (Bulk Scanner):
+ * - Usa una malla fina de 24x24 celdas para separar figuras cercanas sobre una mesa (2, 3, 4 o hasta 10 figuras)
+ *   incluso cuando hay sombras suaves del móvil.
+ * - Combina diferencia cromática RGB respecto al fondo perimetral + energía de gradiente 2D (horizontal y vertical).
+ * - Añade un margen de contexto del 4.5% alrededor de cada figura para no cortar cascos, accesorios ni pies.
  */
 export function detectBulkRegionsFromSource(
   source: HTMLVideoElement | HTMLImageElement,
@@ -197,10 +203,10 @@ export function detectBulkRegionsFromSource(
   ];
 
   try {
-    const gridCols = 12;
-    const gridRows = 8;
-    const sampleW = 120;
-    const sampleH = 80;
+    const gridCols = 24;
+    const gridRows = 24;
+    const sampleW = 192;
+    const sampleH = 192;
     const canvas = document.createElement('canvas');
     canvas.width = sampleW;
     canvas.height = sampleH;
@@ -210,47 +216,98 @@ export function detectBulkRegionsFromSource(
     ctx.drawImage(source, 0, 0, sampleW, sampleH);
     const { data } = ctx.getImageData(0, 0, sampleW, sampleH);
 
-    let bgLumSum = 0;
+    // Muestrear el color medio del borde perimetral (fondo de la mesa)
+    let bgR = 0;
+    let bgG = 0;
+    let bgB = 0;
     let bgCount = 0;
-    for (let x = 0; x < sampleW; x++) {
-      for (const y of [0, 1, sampleH - 2, sampleH - 1]) {
+    for (let x = 0; x < sampleW; x += 2) {
+      for (const y of [2, 5, sampleH - 6, sampleH - 3]) {
         const idx = (y * sampleW + x) * 4;
-        bgLumSum += 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+        bgR += data[idx];
+        bgG += data[idx + 1];
+        bgB += data[idx + 2];
         bgCount++;
       }
     }
-    const bgLum = bgLumSum / Math.max(1, bgCount);
+    for (let y = 8; y < sampleH - 8; y += 3) {
+      for (const x of [2, 5, sampleW - 6, sampleW - 3]) {
+        const idx = (y * sampleW + x) * 4;
+        bgR += data[idx];
+        bgG += data[idx + 1];
+        bgB += data[idx + 2];
+        bgCount++;
+      }
+    }
+    bgR /= Math.max(1, bgCount);
+    bgG /= Math.max(1, bgCount);
+    bgB /= Math.max(1, bgCount);
+    const bgLum = 0.299 * bgR + 0.587 * bgG + 0.114 * bgB;
 
     const cellW = Math.floor(sampleW / gridCols);
     const cellH = Math.floor(sampleH / gridRows);
-    const activeCells: boolean[][] = Array.from({ length: gridRows }, () =>
-      Array(gridCols).fill(false)
+    const cellScores: number[][] = Array.from({ length: gridRows }, () =>
+      Array(gridCols).fill(0)
     );
+
+    const allScores: number[] = [];
 
     for (let r = 0; r < gridRows; r++) {
       for (let c = 0; c < gridCols; c++) {
         let edgeEnergy = 0;
-        let lumDiffSum = 0;
+        let chromaDiff = 0;
+        let lumDiff = 0;
         let pixels = 0;
 
         for (let py = r * cellH; py < (r + 1) * cellH - 1; py++) {
           for (let px = c * cellW; px < (c + 1) * cellW - 1; px++) {
             const idx = (py * sampleW + px) * 4;
             const rightIdx = (py * sampleW + px + 1) * 4;
-            const lum = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+            const downIdx = ((py + 1) * sampleW + px) * 4;
+
+            const pr = data[idx];
+            const pg = data[idx + 1];
+            const pb = data[idx + 2];
+            const lum = 0.299 * pr + 0.587 * pg + 0.114 * pb;
             const rLum =
               0.299 * data[rightIdx] + 0.587 * data[rightIdx + 1] + 0.114 * data[rightIdx + 2];
-            edgeEnergy += Math.abs(lum - rLum);
-            lumDiffSum += Math.abs(lum - bgLum);
+            const dLum =
+              0.299 * data[downIdx] + 0.587 * data[downIdx + 1] + 0.114 * data[downIdx + 2];
+
+            edgeEnergy += Math.abs(lum - rLum) + Math.abs(lum - dLum);
+
+            // Diferencia cromática normalizada (inmune a sombras uniformes sobre mesa blanca)
+            const dr = pr - bgR;
+            const dg = pg - bgG;
+            const db = pb - bgB;
+            const dLumBg = lum - bgLum;
+            const chromaOnly = Math.sqrt(
+              Math.max(0, dr * dr + dg * dg + db * db - dLumBg * dLumBg * 2.4)
+            );
+            chromaDiff += chromaOnly;
+            lumDiff += Math.abs(dLumBg);
             pixels++;
           }
         }
 
         const avgEdge = edgeEnergy / Math.max(1, pixels);
-        const avgDiff = lumDiffSum / Math.max(1, pixels);
-        activeCells[r][c] = avgEdge > 5.5 || avgDiff > 18;
+        const avgChroma = chromaDiff / Math.max(1, pixels);
+        const avgLumDiff = lumDiff / Math.max(1, pixels);
+
+        // El borde local y la saturación pesan más que la simple sombra
+        const score = avgEdge * 1.65 + avgChroma * 0.85 + Math.max(0, avgLumDiff - 22) * 0.45;
+        cellScores[r][c] = score;
+        allScores.push(score);
       }
     }
+
+    const sortedScores = [...allScores].sort((a, b) => a - b);
+    const medianScore = sortedScores[Math.floor(sortedScores.length * 0.5)] || 0;
+    const threshold = Math.max(15.5, medianScore * 1.85);
+
+    const activeCells: boolean[][] = Array.from({ length: gridRows }, (_, r) =>
+      Array.from({ length: gridCols }, (__, c) => cellScores[r][c] >= threshold)
+    );
 
     const visited: boolean[][] = Array.from({ length: gridRows }, () =>
       Array(gridCols).fill(false)
@@ -282,44 +339,81 @@ export function detectBulkRegionsFromSource(
           if (cc < minC) minC = cc;
           if (cc > maxC) maxC = cc;
 
-          for (const [dr, dc] of [
-            [1, 0],
-            [-1, 0],
-            [0, 1],
-            [0, -1]
-          ]) {
-            const nr = cr + dr;
-            const nc = cc + dc;
-            if (
-              nr >= 0 &&
-              nr < gridRows &&
-              nc >= 0 &&
-              nc < gridCols &&
-              activeCells[nr][nc] &&
-              !visited[nr][nc]
-            ) {
-              visited[nr][nc] = true;
-              queue.push([nr, nc]);
+          // Conectividad de 8 vecinos para mantener unida cabeza, torso, piernas y arma
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              if (dr === 0 && dc === 0) continue;
+              const nr = cr + dr;
+              const nc = cc + dc;
+              if (
+                nr >= 0 &&
+                nr < gridRows &&
+                nc >= 0 &&
+                nc < gridCols &&
+                activeCells[nr][nc] &&
+                !visited[nr][nc]
+              ) {
+                visited[nr][nc] = true;
+                queue.push([nr, nc]);
+              }
             }
           }
         }
 
-        if (area >= 2) {
+        const boxW = maxC - minC + 1;
+        const boxH = maxR - minR + 1;
+        // Ignorar motas diminutas (pelos/polvo) o un único bloque que ocupa casi toda la foto
+        if (area >= 4 && boxW >= 2 && boxH >= 2 && !(boxW >= gridCols - 1 && boxH >= gridRows - 1)) {
           components.push({ minR, maxR, minC, maxC, area });
         }
       }
     }
 
-    if (components.length >= 2 && components.length <= maxRegions) {
-      return components
-        .sort((a, b) => a.minR - b.minR || a.minC - b.minC)
+    // Fusionar componentes muy próximos o solapados (ej. casco separado por cuello claro)
+    const merged: typeof components = [];
+    for (const comp of components.sort((a, b) => b.area - a.area)) {
+      const existing = merged.find(
+        (m) =>
+          comp.minC <= m.maxC + 1 &&
+          comp.maxC >= m.minC - 1 &&
+          comp.minR <= m.maxR + 1 &&
+          comp.maxR >= m.minR - 1 &&
+          (Math.min(m.maxC, comp.maxC) - Math.max(m.minC, comp.minC) >= 0 ||
+            Math.min(m.maxR, comp.maxR) - Math.max(m.minR, comp.minR) >= 0)
+      );
+      if (
+        existing &&
+        Math.max(existing.maxC, comp.maxC) - Math.min(existing.minC, comp.minC) <= 9 &&
+        Math.max(existing.maxR, comp.maxR) - Math.min(existing.minR, comp.minR) <= 11
+      ) {
+        existing.minR = Math.min(existing.minR, comp.minR);
+        existing.maxR = Math.max(existing.maxR, comp.maxR);
+        existing.minC = Math.min(existing.minC, comp.minC);
+        existing.maxC = Math.max(existing.maxC, comp.maxC);
+        existing.area += comp.area;
+      } else {
+        merged.push({ ...comp });
+      }
+    }
+
+    if (merged.length >= 1 && merged.length <= maxRegions + 2) {
+      const padX = 0.04;
+      const padY = 0.045;
+      return merged
+        .sort((a, b) => (Math.abs(a.minR - b.minR) <= 3 ? a.minC - b.minC : a.minR - b.minR))
         .slice(0, maxRegions)
-        .map((comp) => ({
-          x: Math.max(0.01, comp.minC / gridCols - 0.015),
-          y: Math.max(0.01, comp.minR / gridRows - 0.015),
-          width: Math.min(0.95, (comp.maxC - comp.minC + 1) / gridCols + 0.03),
-          height: Math.min(0.95, (comp.maxR - comp.minR + 1) / gridRows + 0.03)
-        }));
+        .map((comp) => {
+          const x = Math.max(0.01, comp.minC / gridCols - padX);
+          const y = Math.max(0.01, comp.minR / gridRows - padY);
+          const right = Math.min(0.99, (comp.maxC + 1) / gridCols + padX);
+          const bottom = Math.min(0.99, (comp.maxR + 1) / gridRows + padY);
+          return {
+            x,
+            y,
+            width: Math.max(0.14, right - x),
+            height: Math.max(0.16, bottom - y)
+          };
+        });
     }
 
     return defaultGrid3x2.slice(0, maxRegions);
@@ -509,13 +603,32 @@ export async function identifyMinifigureFromImage(options: {
     };
   }
 
+  const rawBox = parsedData.bounding_box;
+  let normalizedDetectedBox: NormalizedBoundingBox | undefined;
+  if (
+    rawBox &&
+    typeof rawBox.left === 'number' &&
+    typeof rawBox.upper === 'number' &&
+    typeof rawBox.right === 'number' &&
+    typeof rawBox.lower === 'number'
+  ) {
+    const imgW = Math.max(1, rawBox.image_width || 1024);
+    const imgH = Math.max(1, rawBox.image_height || 1024);
+    const nx = Math.max(0, Math.min(0.95, rawBox.left / imgW));
+    const ny = Math.max(0, Math.min(0.95, rawBox.upper / imgH));
+    const nw = Math.max(0.1, Math.min(1 - nx, (rawBox.right - rawBox.left) / imgW));
+    const nh = Math.max(0.1, Math.min(1 - ny, (rawBox.lower - rawBox.upper) / imgH));
+    normalizedDetectedBox = { x: nx, y: ny, width: nw, height: nh };
+  }
+
   const candidates: RecognitionCandidate[] = rawItems.slice(0, 12).map((item) => {
     const minifig = buildMetadataFromBrickognize(item);
     return {
       minifig,
       confidence: Math.min(0.99, Math.max(0.1, Number(item.score) || 0.5)),
       matchedFeatures: minifig.distinguishingFeatures.slice(0, 2),
-      source: 'brickognize_api'
+      source: 'brickognize_api',
+      boundingBox: normalizedDetectedBox
     };
   });
 
@@ -533,7 +646,8 @@ export async function identifyMinifigureFromImage(options: {
 /**
  * Escáner de Lote (Bulk Scanner):
  * Recorta regiones de la foto y consulta Brickognize en paralelo.
- * En fotos reales nunca rellena huecos fallidos con figuras inventadas.
+ * Si el usuario dispara en modo Lote sobre 1 sola figura (o un lote difícil), hace fallback
+ * automático al fotograma completo usando el bounding_box real devuelto por Brickognize.
  */
 export async function identifyBulkLotFromImage(options: {
   sourceElement?: HTMLVideoElement | HTMLImageElement;
@@ -601,7 +715,7 @@ export async function identifyBulkLotFromImage(options: {
         let cropUrl: string | undefined;
 
         try {
-          const cropped = await cropNormalizedRegion(options.sourceElement!, boundingBox, 400);
+          const cropped = await cropNormalizedRegion(options.sourceElement!, boundingBox, 440);
           cropBlob = cropped.blob;
           cropUrl = cropped.dataUrl;
         } catch {
@@ -639,6 +753,40 @@ export async function identifyBulkLotFromImage(options: {
 
     for (const valid of batchResults) {
       if (valid) items.push(valid);
+    }
+  }
+
+  // Fallback inteligente al fotograma completo si los recortes parciales no dieron match
+  if (items.length === 0) {
+    try {
+      const fullFrame = await preprocessImageSourceToBlob(options.sourceElement, 920);
+      const fullRec = await identifyMinifigureFromImage({
+        blob: fullFrame.blob,
+        previewDataUrl: fullFrame.dataUrl
+      });
+      if (fullRec.apiSource === 'brickognize_live' && fullRec.candidates.length > 0) {
+        const primary = fullRec.candidates[0].minifig;
+        const detectedBox = fullRec.candidates[0].boundingBox || {
+          x: 0.16,
+          y: 0.12,
+          width: 0.68,
+          height: 0.76
+        };
+        items.push({
+          boxId: `box-${Date.now()}-1`,
+          slotIndex: 1,
+          boundingBox: detectedBox,
+          cropDataUrl: primary.imageUrl,
+          selectedMinifig: primary,
+          candidates: fullRec.candidates,
+          condition: 'used_complete',
+          quantity: 1,
+          included: true,
+          status: 'matched'
+        });
+      }
+    } catch {
+      // ignore fallback error
     }
   }
 

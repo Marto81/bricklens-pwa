@@ -191,14 +191,20 @@ export async function enrichMinifigMetadata(
 interface LivePricesProxyResponse {
   configured?: boolean;
   liveQuotes?: Partial<Record<MarketplaceId, LivePortalQuoteSnapshot>>;
+  referenceMeta?: {
+    newEur?: number;
+    usedEur?: number;
+    yearReleased?: number;
+    appearsInSets?: number;
+  } | null;
   fetchedAtIso?: string;
 }
 
 /**
  * Construye el informe híbrido de los 5 portales:
  * 1) Precios anotados manualmente por el usuario en IndexedDB (máxima prioridad)
- * 2) Cotizaciones en vivo de BrickOwl / eBay desde caché IndexedDB o proxy servidor
- * 3) Respaldo de catálogo para portales C2C o sin clave
+ * 2) Cotizaciones en vivo de BrickLink (vía Brickset público), BrickOwl o eBay desde caché o proxy
+ * 3) Respaldo calibrado por serie/antigüedad para portales C2C o sin conexión
  */
 export async function fetchHybridPriceReport(
   minifig: MinifigureMetadata,
@@ -218,6 +224,8 @@ export async function fetchHybridPriceReport(
   const cachedTs = cached?.livePricesByCondition?.[condition]?.fetchedAtIso;
   const isCacheFresh = Boolean(cachedTs && Date.now() - Date.parse(cachedTs) < LIVE_PRICES_TTL_MS);
 
+  let effectiveMinifig = minifig;
+
   if (forceRefresh || !isCacheFresh) {
     const { ok, data } = await fetchProxyJson<LivePricesProxyResponse>(
       'prices',
@@ -227,6 +235,21 @@ export async function fetchHybridPriceReport(
 
     if (ok && data?.configured && data.liveQuotes && Object.keys(data.liveQuotes).length > 0) {
       liveQuotes = data.liveQuotes;
+      if (data.referenceMeta) {
+        const refUsed = data.referenceMeta.usedEur ?? minifig.baseMarketPriceEur.used_complete;
+        const refNew = data.referenceMeta.newEur ?? minifig.baseMarketPriceEur.new;
+        effectiveMinifig = {
+          ...minifig,
+          yearReleased: data.referenceMeta.yearReleased ?? minifig.yearReleased,
+          appearsInSets: data.referenceMeta.appearsInSets ?? minifig.appearsInSets,
+          baseMarketPriceEur: {
+            new: refNew,
+            used_complete: refUsed,
+            used_incomplete: Math.round(refUsed * 0.58 * 100) / 100
+          },
+          isEstimatedFallbackPrice: false
+        };
+      }
       const nowIso = new Date().toISOString();
       await db.catalogCache.put({
         figId: key,
@@ -243,10 +266,31 @@ export async function fetchHybridPriceReport(
     }
   }
 
-  return generatePriceComparisonReport(minifig, condition, preferredSource, {
+  return generatePriceComparisonReport(effectiveMinifig, condition, preferredSource, {
     liveQuotes,
     observedPrices
   });
+}
+
+/**
+ * Obtiene en segundo plano el par de precios { usedEur, newEur } reales/híbridos
+ * para actualizar al instante las tarjetas recién escaneadas en Individual o Lote.
+ */
+export async function fetchLiveDualPricesForMinifig(
+  minifig: MinifigureMetadata,
+  preferredSource: PreferredPriceSource = 'weighted'
+): Promise<{ usedEur: number; newEur: number; incompleteEur: number }> {
+  const [usedRep, newRep] = await Promise.all([
+    fetchHybridPriceReport(minifig, 'used_complete', preferredSource, false),
+    fetchHybridPriceReport(minifig, 'new', preferredSource, false)
+  ]);
+  const usedEur = usedRep.estimatedMarketValueEur;
+  const newEur = Math.max(usedEur, newRep.estimatedMarketValueEur);
+  return {
+    usedEur,
+    newEur,
+    incompleteEur: Math.round(usedEur * 0.58 * 100) / 100
+  };
 }
 
 /**

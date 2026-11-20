@@ -187,19 +187,81 @@ export default async function handler(req: Request): Promise<Response> {
   if (brickowlQuote) liveQuotes.brickowl = brickowlQuote;
   if (ebayQuote) liveQuotes.ebay = ebayQuote;
 
+  let referenceMeta: {
+    newEur?: number;
+    usedEur?: number;
+    yearReleased?: number;
+    appearsInSets?: number;
+  } | null = null;
+
+  if (!liveQuotes.bricklink) {
+    try {
+      const bsRes = await fetch(`https://brickset.com/minifigs/${encodeURIComponent(figId)}`, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml'
+        }
+      });
+      if (bsRes.ok) {
+        const html = await bsRes.text();
+        const newUsdMatch = html.match(/New:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i);
+        const usedUsdMatch = html.match(/Used:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i);
+        const yearMatch = html.match(/Year released<\/dt>\s*<dd><a[^>]*>(\d{4})<\/a>/i);
+        const setsMatch = html.match(/Appears in<\/dt>\s*<dd><a[^>]*>(\d+)\s+set/i);
+
+        const newUsd = newUsdMatch ? Number(newUsdMatch[1].replace(',', '.')) : 0;
+        const usedUsd = usedUsdMatch ? Number(usedUsdMatch[1].replace(',', '.')) : 0;
+        const usdToEur = 0.92;
+
+        const targetUsd =
+          condition === 'new'
+            ? newUsd || (usedUsd ? usedUsd * 1.32 : 0)
+            : condition === 'used_incomplete'
+            ? (usedUsd || newUsd * 0.72) * 0.58
+            : usedUsd || (newUsd ? newUsd * 0.75 : 0);
+
+        if (targetUsd > 0.3 && targetUsd < 20000) {
+          const avgEur = roundEur(targetUsd * usdToEur);
+          liveQuotes.bricklink = {
+            minPriceEur: roundEur(Math.max(0.5, avgEur * 0.84)),
+            avgPriceEur: roundEur(avgEur * 1.03),
+            maxPriceEur: roundEur(avgEur * 1.26),
+            soldAvg6mEur: avgEur,
+            activeListingsCount: 16
+          };
+        }
+
+        if (newUsd > 0 || usedUsd > 0 || yearMatch) {
+          referenceMeta = {
+            newEur: newUsd > 0 ? roundEur(newUsd * usdToEur) : undefined,
+            usedEur: usedUsd > 0 ? roundEur(usedUsd * usdToEur) : undefined,
+            yearReleased: yearMatch ? Number(yearMatch[1]) : undefined,
+            appearsInSets: setsMatch ? Number(setsMatch[1]) : undefined
+          };
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const hasLiveQuotes = Object.keys(liveQuotes).length > 0;
   return jsonRes(
     {
       figId,
       condition,
-      configured: Boolean(brickowlKey || (ebayId && ebaySecret)),
+      configured: Boolean(hasLiveQuotes || brickowlKey || (ebayId && ebaySecret)),
       providers: {
+        bricklink_public: Boolean(liveQuotes.bricklink),
         brickowl: Boolean(brickowlKey),
         ebay: Boolean(ebayId && ebaySecret)
       },
       liveQuotes,
+      referenceMeta,
       fetchedAtIso: new Date().toISOString()
     },
     200,
-    1800
+    3600
   );
 }

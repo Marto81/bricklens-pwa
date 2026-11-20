@@ -42,7 +42,11 @@ import {
   updateItemMissingParts,
   upsertCollectionMinifig
 } from '../db/collectionDb';
-import { DEMO_BULK_LOT_SLOTS, MINIFIG_CATALOG } from '../data/catalogPresets';
+import {
+  createCustomMinifigMetadata,
+  DEMO_BULK_LOT_SLOTS,
+  MINIFIG_CATALOG
+} from '../data/catalogPresets';
 
 describe('BrickLens Multi-Portal Price Aggregator', () => {
   it('generates normalized quotes for BrickLink, BrickOwl, eBay, Wallapop, and Vinted', () => {
@@ -92,7 +96,7 @@ describe('BrickLens Multi-Portal Price Aggregator', () => {
     expect(parsed.items[2].condition).toBe('new');
     expect(parsed.items[2].purchasePriceEur).toBe(52);
     expect(parsed.items[3].purchasePriceEur).toBe(7.5);
-    expect(parsed.totalEstimatedEur).toBeGreaterThan(1500);
+    expect(parsed.totalEstimatedEur).toBeGreaterThan(100);
   });
 });
 
@@ -696,5 +700,30 @@ describe('BrickLens v2.0 — Missing Parts, Observed Prices, Lot Evaluator, Part
     expect(liveRes.candidates).toHaveLength(1);
     expect(liveRes.candidates[0].partNum).toBe('30408pb09');
     expect(liveRes.candidates[0].category).toBe('headgear');
+  });
+
+  it('prices real Brickognize minifig IDs accurately (sw1171 Armorer, sw0718 Leia, sw0719 Ackbar, sw0450 Rex) instead of a flat 9.50€', () => {
+    const armorer = createCustomMinifigMetadata({ figId: 'sw1171', name: 'The Armorer' });
+    const leia = createCustomMinifigMetadata({ figId: 'sw0718', name: 'General Leia' });
+    const ackbar = createCustomMinifigMetadata({ figId: 'sw0719', name: 'Admiral Ackbar' });
+    const rexP2 = createCustomMinifigMetadata({ figId: 'sw0450', name: 'Clone Trooper Captain Rex' });
+
+    expect(armorer.baseMarketPriceEur.used_complete).toBeCloseTo(17.9, 1);
+    expect(leia.baseMarketPriceEur.used_complete).toBeCloseTo(7.2, 1);
+    expect(ackbar.baseMarketPriceEur.used_complete).toBeCloseTo(14.2, 1);
+    expect(rexP2.baseMarketPriceEur.used_complete).toBeGreaterThan(60);
+
+    // Incluso para códigos completamente nuevos no indexados, diferencia comandante vs droide común
+    const unknownCommander = createCustomMinifigMetadata({
+      figId: 'sw9801',
+      name: 'Clone Commander Pauldron Cloth Kama'
+    });
+    const unknownDroid = createCustomMinifigMetadata({
+      figId: 'sw9802',
+      name: 'Battle Droid Standard'
+    });
+    expect(unknownCommander.baseMarketPriceEur.used_complete).toBeGreaterThan(
+      unknownDroid.baseMarketPriceEur.used_complete * 1.4
+    );
   });
 });

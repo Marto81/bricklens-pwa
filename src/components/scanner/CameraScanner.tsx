@@ -37,6 +37,7 @@ import {
   allocateLotPurchasePrices,
   getQuickDualPricesEur
 } from '../../services/priceAggregator';
+import { fetchLiveDualPricesForMinifig } from '../../services/catalogService';
 import {
   identifyBulkLotFromImage,
   identifyMinifigureFromImage,
@@ -266,17 +267,62 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     singleQty
   ]);
 
+  const [liveDualMap, setLiveDualMap] = useState<
+    Record<string, { usedEur: number; newEur: number; incompleteEur: number }>
+  >({});
+
+  useEffect(() => {
+    if (detectedCards.length === 0) return;
+    let cancelled = false;
+    const runLiveFetch = async () => {
+      const toFetch = detectedCards.filter(
+        (c) => !liveDualMap[c.selectedMinifig.figId.toLowerCase()]
+      );
+      if (toFetch.length === 0) return;
+      const results = await Promise.all(
+        toFetch.map(async (c) => {
+          try {
+            const dual = await fetchLiveDualPricesForMinifig(
+              c.selectedMinifig,
+              preferredPriceSource
+            );
+            return { figId: c.selectedMinifig.figId.toLowerCase(), dual };
+          } catch {
+            return null;
+          }
+        })
+      );
+      if (cancelled) return;
+      setLiveDualMap((prev) => {
+        const next = { ...prev };
+        for (const r of results) {
+          if (r && r.dual.usedEur > 0) {
+            next[r.figId] = r.dual;
+          }
+        }
+        return next;
+      });
+    };
+    void runLiveFetch();
+    return () => {
+      cancelled = true;
+    };
+  }, [detectedCards, preferredPriceSource, liveDualMap]);
+
   const cardPriceMap = useMemo(() => {
     const out: Record<string, { primary: number; secondary: number; used: number; newVal: number }> =
       {};
     for (const card of detectedCards) {
-      const dual = getQuickDualPricesEur(card.selectedMinifig, preferredPriceSource);
+      const figKey = card.selectedMinifig.figId.toLowerCase();
+      const dual =
+        liveDualMap[figKey] ??
+        getQuickDualPricesEur(card.selectedMinifig, preferredPriceSource);
       const primary = card.condition === 'new' ? dual.newEur : dual.usedEur;
       const secondary = card.condition === 'new' ? dual.usedEur : dual.newEur;
       out[card.key] = { primary, secondary, used: dual.usedEur, newVal: dual.newEur };
     }
     return out;
-  }, [detectedCards, preferredPriceSource]);
+  }, [detectedCards, preferredPriceSource, liveDualMap]);
 
   const overlayPriceByBoxId = useMemo(() => {
     const map: Record<string, number> = {};
@@ -303,6 +349,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   const allAreNew =
     detectedCards.length > 0 && detectedCards.every((c) => c.condition === 'new');
 
+  const [appendToBulkOnNextCapture, setAppendToBulkOnNextCapture] = useState(false);
+
   if (!open) return null;
 
   const resetResults = () => {
@@ -315,6 +363,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     setAltModalCardKey(null);
     setShowLotEvaluator(false);
     setAddedCardKeys({});
+    setAppendToBulkOnNextCapture(false);
   };
 
   const toggleTorch = async () => {
@@ -334,10 +383,14 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     void triggerDemoScan();
   };
 
-  const runRecognitionFromFile = async (file: Blob) => {
+  const runRecognitionFromFile = async (file: Blob, forceAppend = false) => {
     setIsScanning(true);
     setDiagnosticError(null);
-    setAddedCardKeys({});
+    const shouldAppend = forceAppend || appendToBulkOnNextCapture;
+    setAppendToBulkOnNextCapture(false);
+    if (!shouldAppend) {
+      setAddedCardKeys({});
+    }
     const objectUrl = URL.createObjectURL(file);
     try {
       const img = await loadImageElementFromUrl(objectUrl);
@@ -359,14 +412,32 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           sourceElement: img,
           previewDataUrl: prepared.dataUrl
         });
-        setBulkSession(session);
-        const matchedCount = session.items.filter(
+        const newMatched = session.items.filter(
           (i) => i.status !== 'no_match' && i.status !== 'error'
-        ).length;
-        if (matchedCount === 0) {
+        );
+
+        if (shouldAppend && bulkSession && newMatched.length > 0) {
+          setBulkSession((prev) => {
+            if (!prev) return session;
+            const startIdx = prev.items.length;
+            const appended = newMatched.map((it, idx) => ({
+              ...it,
+              boxId: `box-${Date.now()}-${startIdx + idx + 1}`,
+              slotIndex: startIdx + idx + 1
+            }));
+            return {
+              ...session,
+              items: [...prev.items, ...appended]
+            };
+          });
+        } else {
+          setBulkSession(session);
+        }
+
+        if (newMatched.length === 0 && (!shouldAppend || !bulkSession)) {
           setDiagnosticError(
             session.errorMessage ||
-              'No se detectaron figuras claras. Toca "Ajustar recuadros" o acerca más la cámara.'
+              'No se detectaron figuras automáticamente. Toca "+ Añadir recuadro" sobre la foto o escribe el código.'
           );
         }
       } else {
@@ -1138,7 +1209,14 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                         type="button"
                         id="btn-scan-another-tile"
                         className="bm-scan-another-card"
-                        onClick={resetResults}
+                        onClick={() => {
+                          if (captureScope === 'bulk') {
+                            setAppendToBulkOnNextCapture(true);
+                            nativeCameraInputRef.current?.click();
+                          } else {
+                            resetResults();
+                          }
+                        }}
                       >
                         <Plus size={22} />
                         <span>Escanear otra</span>
