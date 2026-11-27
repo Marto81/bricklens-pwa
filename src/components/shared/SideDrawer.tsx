@@ -171,7 +171,10 @@ export const SideDrawer: React.FC<SideDrawerProps> = ({
         </nav>
 
         <div className="bm-drawer-footer">
-          <span>BrickLens PWA · Mercado Europeo (€)</span>
+          <span>
+            BrickLens PWA v{import.meta.env.VITE_APP_VERSION || '3.1.0'} (
+            {import.meta.env.VITE_APP_COMMIT || 'local'}) · Mercado Europeo (€)
+          </span>
         </div>
       </aside>
     </div>

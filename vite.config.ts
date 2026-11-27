@@ -1,8 +1,26 @@
+import { execSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
+const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
+  version?: string;
+};
+let gitSha = 'local';
+try {
+  gitSha = execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+    .toString()
+    .trim();
+} catch {
+  // ignore when .git is not present
+}
+
 export default defineConfig({
+  define: {
+    'import.meta.env.VITE_APP_VERSION': JSON.stringify(pkg.version || '3.1.0'),
+    'import.meta.env.VITE_APP_COMMIT': JSON.stringify(gitSha)
+  },
   plugins: [
     react(),
     VitePWA({

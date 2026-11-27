@@ -147,7 +147,10 @@ export const SettingsSheet: React.FC<SettingsSheetProps> = ({
 
         <div className="sheet-header compact">
           <div>
-            <span className="eyebrow">BrickLens</span>
+            <span className="eyebrow">
+              BrickLens · v{import.meta.env.VITE_APP_VERSION || '3.1.0'} (
+              {import.meta.env.VITE_APP_COMMIT || 'local'})
+            </span>
             <h2 className="sheet-title">Ajustes, APIs y Backup</h2>
           </div>
           <button
