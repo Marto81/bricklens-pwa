@@ -335,7 +335,11 @@ export const PriceComparisonView: React.FC<PriceComparisonViewProps> = ({
               </>
             ) : (
               <>
-                <Plus size={16} /> Añadir a mi colección
+                <Plus size={16} /> Añadir a &ldquo;
+                {collections.find((c) => c.id === activeCollectionId)?.name ||
+                  collections[0]?.name ||
+                  'Mi Colección'}
+                &rdquo;
               </>
             )}
           </button>

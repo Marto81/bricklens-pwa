@@ -145,12 +145,13 @@ export async function encodeFullFrameToJpeg(
 export const encodeFullFrameToWebP = encodeFullFrameToJpeg;
 
 /**
- * Recorta una región normalizada (x, y, width, height en [0..1]) y la codifica en JPEG.
+ * Recorta una región normalizada (x, y, width, height en [0..1]) manteniendo su relación de aspecto
+ * natural (sin marcos artificiales grises que confundan al detector en fondos oscuros o de madera).
  */
 export async function cropNormalizedRegion(
   source: HTMLVideoElement | HTMLImageElement,
   box: NormalizedBox,
-  outputSize = 440
+  outputSize = 480
 ): Promise<{ blob: Blob; dataUrl: string }> {
   const { rawWidth, rawHeight } = resolveRawDimensions(source);
 
@@ -159,27 +160,150 @@ export async function cropNormalizedRegion(
   const sw = Math.max(24, Math.min(rawWidth - sx, Math.round(box.width * rawWidth)));
   const sh = Math.max(24, Math.min(rawHeight - sy, Math.round(box.height * rawHeight)));
 
+  const longest = Math.max(sw, sh);
+  const scale = Math.min(1, outputSize / Math.max(1, longest));
+  const targetW = Math.max(120, Math.round(sw * scale));
+  const targetH = Math.max(120, Math.round(sh * scale));
+
   const canvas = document.createElement('canvas');
-  canvas.width = outputSize;
-  canvas.height = outputSize;
+  canvas.width = targetW;
+  canvas.height = targetH;
   const ctx = canvas.getContext('2d');
   if (!ctx) {
     throw new Error('No se pudo crear recorte en canvas');
   }
 
-  // Relleno neutro claro que no crea bordes artificiales con fondos de mesa claros
-  ctx.fillStyle = '#e5e7eb';
-  ctx.fillRect(0, 0, outputSize, outputSize);
+  ctx.drawImage(source, sx, sy, sw, sh, 0, 0, targetW, targetH);
 
-  const fitScale = Math.min((outputSize * 0.92) / sw, (outputSize * 0.92) / sh);
-  const dw = Math.round(sw * fitScale);
-  const dh = Math.round(sh * fitScale);
-  const dx = Math.round((outputSize - dw) / 2);
-  const dy = Math.round((outputSize - dh) / 2);
+  return encodeCanvasToJpeg(canvas, 0.9);
+}
 
-  ctx.drawImage(source, sx, sy, sw, sh, dx, dy, dw, dh);
+interface GridComponent {
+  minR: number;
+  maxR: number;
+  minC: number;
+  maxC: number;
+  area: number;
+}
 
-  return encodeCanvasToJpeg(canvas, 0.88);
+/**
+ * Divide un bloque demasiado ancho (2 o más minifiguras de pie muy juntas) o demasiado alto
+ * (2 filas tocándose) buscando el valle de mínima energía entre picos.
+ */
+function splitMergedComponent(
+  comp: GridComponent,
+  cellScores: number[][],
+  rawWidth: number,
+  rawHeight: number,
+  gridCols: number,
+  gridRows: number,
+  depth = 0
+): GridComponent[] {
+  if (depth >= 3) return [comp];
+
+  const boxW = comp.maxC - comp.minC + 1;
+  const boxH = comp.maxR - comp.minR + 1;
+  const pxW = (boxW / gridCols) * rawWidth;
+  const pxH = (boxH / gridRows) * rawHeight;
+  const aspect = pxW / Math.max(1, pxH);
+
+  // Caso 1: Varias minifiguras de pie lado a lado (ancho >> alto)
+  if (aspect > 1.32 && boxW >= 6) {
+    const colProfile: number[] = [];
+    for (let c = comp.minC; c <= comp.maxC; c++) {
+      let sum = 0;
+      for (let r = comp.minR; r <= comp.maxR; r++) {
+        sum += cellScores[r][c];
+      }
+      colProfile.push(sum);
+    }
+
+    let bestSplitIdx = -1;
+    let bestValleyRatio = 0.72;
+    for (let i = 2; i <= colProfile.length - 3; i++) {
+      const leftMax = Math.max(...colProfile.slice(0, i));
+      const rightMax = Math.max(...colProfile.slice(i + 1));
+      const minPeak = Math.min(leftMax, rightMax);
+      if (minPeak <= 0) continue;
+      const ratio = colProfile[i] / minPeak;
+      if (ratio < bestValleyRatio) {
+        bestValleyRatio = ratio;
+        bestSplitIdx = i;
+      }
+    }
+
+    if (bestSplitIdx > 0) {
+      const splitCol = comp.minC + bestSplitIdx;
+      const left: GridComponent = {
+        minR: comp.minR,
+        maxR: comp.maxR,
+        minC: comp.minC,
+        maxC: splitCol,
+        area: Math.max(4, Math.round(comp.area * (bestSplitIdx / colProfile.length)))
+      };
+      const right: GridComponent = {
+        minR: comp.minR,
+        maxR: comp.maxR,
+        minC: splitCol,
+        maxC: comp.maxC,
+        area: Math.max(4, comp.area - left.area)
+      };
+      return [
+        ...splitMergedComponent(left, cellScores, rawWidth, rawHeight, gridCols, gridRows, depth + 1),
+        ...splitMergedComponent(right, cellScores, rawWidth, rawHeight, gridCols, gridRows, depth + 1)
+      ];
+    }
+  }
+
+  // Caso 2: Dos filas de minifiguras tocándose verticalmente
+  if (aspect < 0.44 && boxH >= 10) {
+    const rowProfile: number[] = [];
+    for (let r = comp.minR; r <= comp.maxR; r++) {
+      let sum = 0;
+      for (let c = comp.minC; c <= comp.maxC; c++) {
+        sum += cellScores[r][c];
+      }
+      rowProfile.push(sum);
+    }
+
+    let bestSplitIdx = -1;
+    let bestValleyRatio = 0.72;
+    for (let i = 3; i <= rowProfile.length - 4; i++) {
+      const topMax = Math.max(...rowProfile.slice(0, i));
+      const botMax = Math.max(...rowProfile.slice(i + 1));
+      const minPeak = Math.min(topMax, botMax);
+      if (minPeak <= 0) continue;
+      const ratio = rowProfile[i] / minPeak;
+      if (ratio < bestValleyRatio) {
+        bestValleyRatio = ratio;
+        bestSplitIdx = i;
+      }
+    }
+
+    if (bestSplitIdx > 0) {
+      const splitRow = comp.minR + bestSplitIdx;
+      const top: GridComponent = {
+        minR: comp.minR,
+        maxR: splitRow,
+        minC: comp.minC,
+        maxC: comp.maxC,
+        area: Math.max(4, Math.round(comp.area * (bestSplitIdx / rowProfile.length)))
+      };
+      const bot: GridComponent = {
+        minR: splitRow,
+        maxR: comp.maxR,
+        minC: comp.minC,
+        maxC: comp.maxC,
+        area: Math.max(4, comp.area - top.area)
+      };
+      return [
+        ...splitMergedComponent(top, cellScores, rawWidth, rawHeight, gridCols, gridRows, depth + 1),
+        ...splitMergedComponent(bot, cellScores, rawWidth, rawHeight, gridCols, gridRows, depth + 1)
+      ];
+    }
+  }
+
+  return [comp];
 }
 
 /**
@@ -187,11 +311,12 @@ export async function cropNormalizedRegion(
  * - Usa una malla fina de 24x24 celdas para separar figuras cercanas sobre una mesa (2, 3, 4 o hasta 10 figuras)
  *   incluso cuando hay sombras suaves del móvil.
  * - Combina diferencia cromática RGB respecto al fondo perimetral + energía de gradiente 2D (horizontal y vertical).
- * - Añade un margen de contexto del 4.5% alrededor de cada figura para no cortar cascos, accesorios ni pies.
+ * - Divide automáticamente bloques unidos por valle de mínima energía cuando dos figuras están casi tocándose.
+ * - Añade un margen de contexto del 4% alrededor de cada figura para no cortar cascos, accesorios ni pies.
  */
 export function detectBulkRegionsFromSource(
   source: HTMLVideoElement | HTMLImageElement,
-  maxRegions = 8
+  maxRegions = 10
 ): NormalizedBox[] {
   const defaultGrid3x2: NormalizedBox[] = [
     { x: 0.04, y: 0.05, width: 0.28, height: 0.43 },
@@ -203,6 +328,7 @@ export function detectBulkRegionsFromSource(
   ];
 
   try {
+    const { rawWidth, rawHeight } = resolveRawDimensions(source);
     const gridCols = 24;
     const gridRows = 24;
     const sampleW = 192;
@@ -211,7 +337,7 @@ export function detectBulkRegionsFromSource(
     canvas.width = sampleW;
     canvas.height = sampleH;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return defaultGrid3x2;
+    if (!ctx) return defaultGrid3x2.slice(0, maxRegions);
 
     ctx.drawImage(source, 0, 0, sampleW, sampleH);
     const { data } = ctx.getImageData(0, 0, sampleW, sampleH);
@@ -312,13 +438,7 @@ export function detectBulkRegionsFromSource(
     const visited: boolean[][] = Array.from({ length: gridRows }, () =>
       Array(gridCols).fill(false)
     );
-    const components: Array<{
-      minR: number;
-      maxR: number;
-      minC: number;
-      maxC: number;
-      area: number;
-    }> = [];
+    const components: GridComponent[] = [];
 
     for (let r = 0; r < gridRows; r++) {
       for (let c = 0; c < gridCols; c++) {
@@ -369,8 +489,8 @@ export function detectBulkRegionsFromSource(
       }
     }
 
-    // Fusionar componentes muy próximos o solapados (ej. casco separado por cuello claro)
-    const merged: typeof components = [];
+    // Fusionar componentes muy próximos o solapados verticalmente (ej. casco separado por cuello claro)
+    const merged: GridComponent[] = [];
     for (const comp of components.sort((a, b) => b.area - a.area)) {
       const existing = merged.find(
         (m) =>
@@ -396,10 +516,18 @@ export function detectBulkRegionsFromSource(
       }
     }
 
-    if (merged.length >= 1 && merged.length <= maxRegions + 2) {
-      const padX = 0.04;
-      const padY = 0.045;
-      return merged
+    // Dividir bloques anchos/altos que contengan 2+ figuras casi pegadas en una mesa real
+    const separated: GridComponent[] = [];
+    for (const comp of merged) {
+      separated.push(
+        ...splitMergedComponent(comp, cellScores, rawWidth, rawHeight, gridCols, gridRows)
+      );
+    }
+
+    if (separated.length >= 1 && separated.length <= maxRegions + 2) {
+      const padX = 0.038;
+      const padY = 0.042;
+      return separated
         .sort((a, b) => (Math.abs(a.minR - b.minR) <= 3 ? a.minC - b.minC : a.minR - b.minR))
         .slice(0, maxRegions)
         .map((comp) => {
@@ -410,8 +538,8 @@ export function detectBulkRegionsFromSource(
           return {
             x,
             y,
-            width: Math.max(0.14, right - x),
-            height: Math.max(0.16, bottom - y)
+            width: Math.max(0.12, right - x),
+            height: Math.max(0.15, bottom - y)
           };
         });
     }
@@ -643,6 +771,41 @@ export async function identifyMinifigureFromImage(options: {
   };
 }
 
+function computeBoxIoU(a: NormalizedBoundingBox, b: NormalizedBoundingBox): number {
+  const x1 = Math.max(a.x, b.x);
+  const y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.width, b.x + b.width);
+  const y2 = Math.min(a.y + a.height, b.y + b.height);
+  const interW = Math.max(0, x2 - x1);
+  const interH = Math.max(0, y2 - y1);
+  const interArea = interW * interH;
+  if (interArea <= 0) return 0;
+  const unionArea = a.width * a.height + b.width * b.height - interArea;
+  return unionArea > 0 ? interArea / unionArea : 0;
+}
+
+function refineBoxWithInnerDetection(
+  outerBox: NormalizedBoundingBox,
+  innerBox?: NormalizedBoundingBox,
+  boxScore = 0
+): NormalizedBoundingBox {
+  if (!innerBox || boxScore < 0.35 || innerBox.width < 0.12 || innerBox.height < 0.12) {
+    return outerBox;
+  }
+  const padX = outerBox.width * 0.04;
+  const padY = outerBox.height * 0.04;
+  const x = Math.max(0.005, outerBox.x + innerBox.x * outerBox.width - padX);
+  const y = Math.max(0.005, outerBox.y + innerBox.y * outerBox.height - padY);
+  const right = Math.min(0.995, outerBox.x + (innerBox.x + innerBox.width) * outerBox.width + padX);
+  const bottom = Math.min(0.995, outerBox.y + (innerBox.y + innerBox.height) * outerBox.height + padY);
+  return {
+    x: Math.round(x * 1000) / 1000,
+    y: Math.round(y * 1000) / 1000,
+    width: Math.max(0.08, Math.round((right - x) * 1000) / 1000),
+    height: Math.max(0.1, Math.round((bottom - y) * 1000) / 1000)
+  };
+}
+
 /**
  * Escáner de Lote (Bulk Scanner):
  * Recorta regiones de la foto y consulta Brickognize en paralelo.
@@ -653,6 +816,7 @@ export async function identifyBulkLotFromImage(options: {
   sourceElement?: HTMLVideoElement | HTMLImageElement;
   previewDataUrl?: string;
   isDemoLot?: boolean;
+  onProgress?: (completed: number, total: number) => void;
 }): Promise<BulkScanSession> {
   const startTime = performance.now();
   const sessionId = `bulk-${Date.now()}`;
@@ -700,10 +864,13 @@ export async function identifyBulkLotFromImage(options: {
     };
   }
 
-  const boxes = detectBulkRegionsFromSource(options.sourceElement, 8);
-  const items: BulkScanDetectedItem[] = [];
+  const boxes = detectBulkRegionsFromSource(options.sourceElement, 10);
+  const rawMatched: BulkScanDetectedItem[] = [];
   let errorCount = 0;
   let lastErrorMessage = '';
+  let completed = 0;
+
+  options.onProgress?.(0, boxes.length);
 
   const batchSize = 3;
   for (let i = 0; i < boxes.length; i += batchSize) {
@@ -715,7 +882,7 @@ export async function identifyBulkLotFromImage(options: {
         let cropUrl: string | undefined;
 
         try {
-          const cropped = await cropNormalizedRegion(options.sourceElement!, boundingBox, 440);
+          const cropped = await cropNormalizedRegion(options.sourceElement!, boundingBox, 480);
           cropBlob = cropped.blob;
           cropUrl = cropped.dataUrl;
         } catch {
@@ -727,12 +894,20 @@ export async function identifyBulkLotFromImage(options: {
           previewDataUrl: cropUrl || ''
         });
 
+        completed += 1;
+        options.onProgress?.(completed, boxes.length);
+
         if (recognition.apiSource === 'brickognize_live' && recognition.candidates.length > 0) {
           const primary = recognition.candidates[0].minifig;
+          const snappedBox = refineBoxWithInnerDetection(
+            boundingBox,
+            recognition.candidates[0].boundingBox,
+            recognition.detectedBoxScore
+          );
           return {
             boxId: `box-${Date.now()}-${slotNumber}`,
             slotIndex: slotNumber,
-            boundingBox,
+            boundingBox: snappedBox,
             cropDataUrl: cropUrl || primary.imageUrl,
             selectedMinifig: primary,
             candidates: recognition.candidates,
@@ -752,7 +927,26 @@ export async function identifyBulkLotFromImage(options: {
     );
 
     for (const valid of batchResults) {
-      if (valid) items.push(valid);
+      if (valid) rawMatched.push(valid);
+    }
+  }
+
+  // Deduplicar cajas que apunten a exactamente la misma minifigura física (IoU > 0.50)
+  const items: BulkScanDetectedItem[] = [];
+  for (const cand of rawMatched) {
+    const dupIdx = items.findIndex(
+      (existing) =>
+        existing.selectedMinifig.figId.toLowerCase() === cand.selectedMinifig.figId.toLowerCase() &&
+        computeBoxIoU(existing.boundingBox, cand.boundingBox) > 0.48
+    );
+    if (dupIdx >= 0) {
+      const existingConf = items[dupIdx].candidates[0]?.confidence ?? 0;
+      const candConf = cand.candidates[0]?.confidence ?? 0;
+      if (candConf > existingConf) {
+        items[dupIdx] = cand;
+      }
+    } else {
+      items.push(cand);
     }
   }
 

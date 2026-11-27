@@ -143,11 +143,14 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   const [addedCardKeys, setAddedCardKeys] = useState<Record<string, boolean>>({});
   const [diagnosticError, setDiagnosticError] = useState<string | null>(null);
   const [targetCollectionId, setTargetCollectionId] = useState<string>(activeCollectionId ?? '');
+  const [scanProgress, setScanProgress] = useState<{ done: number; total: number } | null>(null);
+  const [torchHint, setTorchHint] = useState<string | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const nativeCameraInputRef = useRef<HTMLInputElement | null>(null);
+  const inFlightLiveRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     setTargetCollectionId(activeCollectionId ?? collections[0]?.id ?? '');
@@ -214,6 +217,17 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         (captureScope === 'bulk' && bulkSession !== null))) ||
     (topTarget === 'parts' && partResult !== null);
 
+  // Re-vincular el MediaStream al elemento <video> al volver desde Resultados (evita pantalla negra en móvil)
+  useEffect(() => {
+    if (!open || !cameraActive || hasResults) return;
+    const videoEl = videoRef.current;
+    const stream = streamRef.current;
+    if (videoEl && stream && videoEl.srcObject !== stream) {
+      videoEl.srcObject = stream;
+      void videoEl.play().catch(() => {});
+    }
+  }, [open, cameraActive, hasResults]);
+
   const activeCol = useMemo(
     () => collections.find((c) => c.id === targetCollectionId) ?? collections[0] ?? null,
     [collections, targetCollectionId]
@@ -275,20 +289,30 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     if (detectedCards.length === 0) return;
     let cancelled = false;
     const runLiveFetch = async () => {
-      const toFetch = detectedCards.filter(
-        (c) => !liveDualMap[c.selectedMinifig.figId.toLowerCase()]
-      );
+      const toFetch = detectedCards.filter((c) => {
+        const cacheKey = `${preferredPriceSource}:${c.selectedMinifig.figId.toLowerCase()}`;
+        return !liveDualMap[cacheKey] && !inFlightLiveRef.current.has(cacheKey);
+      });
       if (toFetch.length === 0) return;
+      for (const c of toFetch) {
+        inFlightLiveRef.current.add(
+          `${preferredPriceSource}:${c.selectedMinifig.figId.toLowerCase()}`
+        );
+      }
+
       const results = await Promise.all(
         toFetch.map(async (c) => {
+          const cacheKey = `${preferredPriceSource}:${c.selectedMinifig.figId.toLowerCase()}`;
           try {
             const dual = await fetchLiveDualPricesForMinifig(
               c.selectedMinifig,
               preferredPriceSource
             );
-            return { figId: c.selectedMinifig.figId.toLowerCase(), dual };
+            return { cacheKey, dual };
           } catch {
             return null;
+          } finally {
+            inFlightLiveRef.current.delete(cacheKey);
           }
         })
       );
@@ -297,7 +321,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         const next = { ...prev };
         for (const r of results) {
           if (r && r.dual.usedEur > 0) {
-            next[r.figId] = r.dual;
+            next[r.cacheKey] = r.dual;
           }
         }
         return next;
@@ -307,15 +331,16 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [detectedCards, preferredPriceSource, liveDualMap]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectedCards, preferredPriceSource]);
 
   const cardPriceMap = useMemo(() => {
     const out: Record<string, { primary: number; secondary: number; used: number; newVal: number }> =
       {};
     for (const card of detectedCards) {
-      const figKey = card.selectedMinifig.figId.toLowerCase();
+      const cacheKey = `${preferredPriceSource}:${card.selectedMinifig.figId.toLowerCase()}`;
       const dual =
-        liveDualMap[figKey] ??
+        liveDualMap[cacheKey] ??
         getQuickDualPricesEur(card.selectedMinifig, preferredPriceSource);
       const primary = card.condition === 'new' ? dual.newEur : dual.usedEur;
       const secondary = card.condition === 'new' ? dual.usedEur : dual.newEur;
@@ -364,6 +389,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     setShowLotEvaluator(false);
     setAddedCardKeys({});
     setAppendToBulkOnNextCapture(false);
+    setScanProgress(null);
   };
 
   const toggleTorch = async () => {
@@ -375,17 +401,20 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
           advanced: [{ torch: next } as MediaTrackConstraintSet]
         });
         setTorchOn(next);
+        setTorchHint(null);
         return;
       } catch {
-        // dispositivo sin flash web -> lanzar demo rápida
+        // dispositivo sin flash web
       }
     }
-    void triggerDemoScan();
+    setTorchHint('Flash no disponible en este navegador · usa ✨ arriba para demo');
+    setTimeout(() => setTorchHint(null), 2600);
   };
 
   const runRecognitionFromFile = async (file: Blob, forceAppend = false) => {
     setIsScanning(true);
     setDiagnosticError(null);
+    setScanProgress(null);
     const shouldAppend = forceAppend || appendToBulkOnNextCapture;
     setAppendToBulkOnNextCapture(false);
     if (!shouldAppend) {
@@ -410,7 +439,8 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       if (captureScope === 'bulk') {
         const session = await identifyBulkLotFromImage({
           sourceElement: img,
-          previewDataUrl: prepared.dataUrl
+          previewDataUrl: prepared.dataUrl,
+          onProgress: (done, total) => setScanProgress({ done, total })
         });
         const newMatched = session.items.filter(
           (i) => i.status !== 'no_match' && i.status !== 'error'
@@ -462,6 +492,7 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     } finally {
       URL.revokeObjectURL(objectUrl);
       setIsScanning(false);
+      setScanProgress(null);
     }
   };
 
@@ -578,6 +609,12 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
   };
 
   const swapCardCandidate = (cardKey: string, minifig: MinifigureMetadata) => {
+    setAddedCardKeys((prev) => {
+      if (!prev[cardKey]) return prev;
+      const copy = { ...prev };
+      delete copy[cardKey];
+      return copy;
+    });
     if (captureScope === 'single' && singleResult) {
       const idx = singleResult.candidates.findIndex((c) => c.minifig.figId === minifig.figId);
       if (idx >= 0) setSingleCandidateIdx(idx);
@@ -775,6 +812,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
     );
     const meta = existing ?? createCustomMinifigMetadata({ figId: clean });
     setDiagnosticError(null);
+    setAddedCardKeys({});
+    setSingleCandidateIdx(0);
+    setSingleCondition('used_complete');
+    setSingleQty(1);
     setSingleResult({
       scanId: `manual-${Date.now()}`,
       capturedAtIso: new Date().toISOString(),
@@ -873,7 +914,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
       </header>
 
       {/* Zona de Cámara / Imagen congelada con recuadros verdes */}
-      <div className={`bm-scanner-viewport ${hasResults ? 'compact' : ''}`}>
+      <div
+        className={`bm-scanner-viewport ${hasResults ? 'compact' : ''} ${
+          hasResults && bulkEditBoxes ? 'expanded-editor' : ''
+        }`}
+      >
         {!hasResults ? (
           <>
             <video
@@ -898,12 +943,18 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
                 </div>
               </div>
             )}
+            {torchHint && (
+              <div className="bm-cam-toast" role="status">
+                {torchHint}
+              </div>
+            )}
           </>
         ) : topTarget === 'minifigs' && captureScope === 'bulk' && bulkSession ? (
           <div className="bm-frozen-overlay-wrap">
             <InteractiveBulkOverlay
               imageUrl={bulkSession.sourceImageDataUrl}
               aspectRatio={bulkSession.aspectRatio}
+              expanded={bulkEditBoxes}
               items={bulkSession.items}
               priceByBoxId={overlayPriceByBoxId}
               selectedBoxId={selectedBulkBoxId}
@@ -936,7 +987,11 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
         {isScanning && (
           <div className="bm-scanning-hud">
             <Loader2 size={24} className="spin" />
-            <span>Identificando con Brickognize…</span>
+            <span>
+              {scanProgress && scanProgress.total > 1
+                ? `Analizando lote (${scanProgress.done}/${scanProgress.total})…`
+                : 'Identificando con Brickognize…'}
+            </span>
           </div>
         )}
       </div>
@@ -949,7 +1004,10 @@ export const CameraScanner: React.FC<CameraScannerProps> = ({
               type="button"
               id="btn-upload-photo"
               className="bm-cam-circle-btn lg"
-              onClick={() => galleryInputRef.current?.click()}
+              onClick={() => {
+                setAppendToBulkOnNextCapture(false);
+                galleryInputRef.current?.click();
+              }}
               aria-label="Subir desde galería"
             >
               <ImageIcon size={21} />

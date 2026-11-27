@@ -200,6 +200,28 @@ interface LivePricesProxyResponse {
   fetchedAtIso?: string;
 }
 
+const inFlightPriceRequests = new Map<string, Promise<{ ok: boolean; data: LivePricesProxyResponse | null }>>();
+
+function applyReferenceMeta(
+  minifig: MinifigureMetadata,
+  meta?: LivePricesProxyResponse['referenceMeta']
+): MinifigureMetadata {
+  if (!meta) return minifig;
+  const refUsed = meta.usedEur ?? minifig.baseMarketPriceEur.used_complete;
+  const refNew = meta.newEur ?? minifig.baseMarketPriceEur.new;
+  return {
+    ...minifig,
+    yearReleased: meta.yearReleased ?? minifig.yearReleased,
+    appearsInSets: meta.appearsInSets ?? minifig.appearsInSets,
+    baseMarketPriceEur: {
+      new: Math.max(refUsed, refNew),
+      used_complete: refUsed,
+      used_incomplete: Math.round(refUsed * 0.58 * 100) / 100
+    },
+    isEstimatedFallbackPrice: false
+  };
+}
+
 /**
  * Construye el informe híbrido de los 5 portales:
  * 1) Precios anotados manualmente por el usuario en IndexedDB (máxima prioridad)
@@ -218,46 +240,43 @@ export async function fetchHybridPriceReport(
     db.catalogCache.get(key)
   ]);
 
+  const cachedCond = cached?.livePricesByCondition?.[condition];
   let liveQuotes: Partial<Record<MarketplaceId, LivePortalQuoteSnapshot>> | undefined =
-    cached?.livePricesByCondition?.[condition]?.liveQuotes;
+    cachedCond?.liveQuotes;
+  let referenceMeta = cachedCond?.referenceMeta ?? null;
 
-  const cachedTs = cached?.livePricesByCondition?.[condition]?.fetchedAtIso;
+  const cachedTs = cachedCond?.fetchedAtIso;
   const isCacheFresh = Boolean(cachedTs && Date.now() - Date.parse(cachedTs) < LIVE_PRICES_TTL_MS);
 
-  let effectiveMinifig = minifig;
-
   if (forceRefresh || !isCacheFresh) {
-    const { ok, data } = await fetchProxyJson<LivePricesProxyResponse>(
-      'prices',
-      `figId=${encodeURIComponent(minifig.figId)}&name=${encodeURIComponent(minifig.name)}&condition=${encodeURIComponent(condition)}`,
-      9000
-    );
+    const reqKey = `${key}:${condition}`;
+    let pending = !forceRefresh ? inFlightPriceRequests.get(reqKey) : undefined;
+    if (!pending) {
+      pending = fetchProxyJson<LivePricesProxyResponse>(
+        'prices',
+        `figId=${encodeURIComponent(minifig.figId)}&name=${encodeURIComponent(minifig.name)}&condition=${encodeURIComponent(condition)}`,
+        9000
+      ).finally(() => {
+        inFlightPriceRequests.delete(reqKey);
+      });
+      inFlightPriceRequests.set(reqKey, pending);
+    }
+
+    const { ok, data } = await pending;
 
     if (ok && data?.configured && data.liveQuotes && Object.keys(data.liveQuotes).length > 0) {
       liveQuotes = data.liveQuotes;
-      if (data.referenceMeta) {
-        const refUsed = data.referenceMeta.usedEur ?? minifig.baseMarketPriceEur.used_complete;
-        const refNew = data.referenceMeta.newEur ?? minifig.baseMarketPriceEur.new;
-        effectiveMinifig = {
-          ...minifig,
-          yearReleased: data.referenceMeta.yearReleased ?? minifig.yearReleased,
-          appearsInSets: data.referenceMeta.appearsInSets ?? minifig.appearsInSets,
-          baseMarketPriceEur: {
-            new: refNew,
-            used_complete: refUsed,
-            used_incomplete: Math.round(refUsed * 0.58 * 100) / 100
-          },
-          isEstimatedFallbackPrice: false
-        };
-      }
+      referenceMeta = data.referenceMeta ?? referenceMeta;
       const nowIso = new Date().toISOString();
+      const latestCached = await db.catalogCache.get(key);
       await db.catalogCache.put({
         figId: key,
-        rebrickableData: cached?.rebrickableData,
+        rebrickableData: latestCached?.rebrickableData ?? cached?.rebrickableData,
         livePricesByCondition: {
-          ...cached?.livePricesByCondition,
+          ...(latestCached?.livePricesByCondition ?? cached?.livePricesByCondition),
           [condition]: {
             liveQuotes,
+            referenceMeta,
             fetchedAtIso: nowIso
           }
         },
@@ -265,6 +284,8 @@ export async function fetchHybridPriceReport(
       });
     }
   }
+
+  const effectiveMinifig = applyReferenceMeta(minifig, referenceMeta);
 
   return generatePriceComparisonReport(effectiveMinifig, condition, preferredSource, {
     liveQuotes,

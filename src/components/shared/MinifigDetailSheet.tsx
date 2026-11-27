@@ -22,11 +22,12 @@ import type {
   UserCollection
 } from '../../types/minifig';
 import { COLLECTION_DOT_COLORS } from '../../db/collectionDb';
-import { enrichMinifigMetadata } from '../../services/catalogService';
+import { enrichMinifigMetadata, fetchHybridPriceReport } from '../../services/catalogService';
 import {
   computeMissingPartsAdjustment,
   generatePriceComparisonReport,
-  getPartMarketplaceLinks
+  getPartMarketplaceLinks,
+  resolvePreferredPriceFromQuotes
 } from '../../services/priceAggregator';
 import { PriceAverageCard } from './PriceAverageCard';
 
@@ -52,7 +53,13 @@ interface MinifigDetailSheetProps {
     itemId: string,
     purchasePriceEur: number,
     marketValueEur: number,
-    notes: string
+    notes: string,
+    extras?: {
+      condition?: MinifigCondition;
+      quantity?: number;
+      missingPartNums?: string[];
+      minifig?: MinifigureMetadata;
+    }
   ) => Promise<void>;
   onAddNewToCollection?: (params: {
     collectionId?: string | null;
@@ -108,7 +115,8 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
   const [missingParts, setMissingParts] = useState<string[]>(
     collectionItem?.missingPartNums ?? initialMissingPartNums ?? []
   );
-  const [latestReport, setLatestReport] = useState<PriceComparisonReport | null>(null);
+  const [liveUsedReport, setLiveUsedReport] = useState<PriceComparisonReport | null>(null);
+  const [liveNewReport, setLiveNewReport] = useState<PriceComparisonReport | null>(null);
   const [targetCollectionId, setTargetCollectionId] = useState<string>(activeCollectionId ?? '');
   const [showPriceSourceModal, setShowPriceSourceModal] = useState(false);
   const [showAdvancedPortals, setShowAdvancedPortals] = useState(false);
@@ -124,6 +132,8 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
     setCondition(collectionItem?.condition ?? initialCondition);
     setQuantity(1);
     setMissingParts(collectionItem?.missingPartNums ?? initialMissingPartNums ?? []);
+    setLiveUsedReport(null);
+    setLiveNewReport(null);
     setTargetCollectionId(
       collectionItem?.collectionId ?? activeCollectionId ?? collections[0]?.id ?? ''
     );
@@ -165,6 +175,26 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
     collections
   ]);
 
+  // Hidratar precios híbridos en vivo (BrickLink/Brickset + anotados por usuario) al abrir la ficha
+  useEffect(() => {
+    if (!open || !minifig) return;
+    let cancelled = false;
+    const loadLivePrices = async () => {
+      const [usedRep, newRep] = await Promise.all([
+        fetchHybridPriceReport(minifig, 'used_complete', preferredPriceSource, false),
+        fetchHybridPriceReport(minifig, 'new', preferredPriceSource, false)
+      ]);
+      if (!cancelled) {
+        setLiveUsedReport(usedRep);
+        setLiveNewReport(newRep);
+      }
+    };
+    void loadLivePrices();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, minifig, preferredPriceSource]);
+
   useEffect(() => {
     if (!open) return;
     const handleKey = (e: KeyboardEvent) => {
@@ -179,32 +209,29 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
 
   const activeFig = resolvedFig ?? minifig;
 
-  const baseCompleteReferenceEur = useMemo(() => {
-    if (!activeFig) return 0;
-    if (collectionItem?.baseCompleteUnitValueEur) {
-      return collectionItem.baseCompleteUnitValueEur;
-    }
-    if (latestReport && condition !== 'used_incomplete') {
-      return latestReport.estimatedMarketValueEur;
-    }
-    return generatePriceComparisonReport(
-      activeFig,
-      condition === 'new' ? 'new' : 'used_complete',
-      preferredPriceSource
-    ).estimatedMarketValueEur;
-  }, [activeFig, collectionItem, latestReport, condition, preferredPriceSource]);
-
   const usedPriceEur = useMemo(() => {
     if (!activeFig) return 0;
+    if (liveUsedReport) return liveUsedReport.estimatedMarketValueEur;
     return generatePriceComparisonReport(activeFig, 'used_complete', preferredPriceSource)
       .estimatedMarketValueEur;
-  }, [activeFig, preferredPriceSource]);
+  }, [activeFig, liveUsedReport, preferredPriceSource]);
 
   const newPriceEur = useMemo(() => {
     if (!activeFig) return 0;
+    if (liveNewReport) return liveNewReport.estimatedMarketValueEur;
     return generatePriceComparisonReport(activeFig, 'new', preferredPriceSource)
       .estimatedMarketValueEur;
-  }, [activeFig, preferredPriceSource]);
+  }, [activeFig, liveNewReport, preferredPriceSource]);
+
+  const baseCompleteReferenceEur = useMemo(() => {
+    if (!activeFig) return 0;
+    if (condition === 'new') return newPriceEur;
+    if (liveUsedReport) return liveUsedReport.estimatedMarketValueEur;
+    if (collectionItem?.baseCompleteUnitValueEur) {
+      return collectionItem.baseCompleteUnitValueEur;
+    }
+    return usedPriceEur;
+  }, [activeFig, condition, newPriceEur, usedPriceEur, liveUsedReport, collectionItem]);
 
   const missingSummary = useMemo(() => {
     if (!activeFig) {
@@ -230,6 +257,7 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
       : usedPriceEur;
 
   const displaySecondaryPriceEur = condition === 'new' ? usedPriceEur : newPriceEur;
+  const activeConditionReport = condition === 'new' ? liveNewReport : liveUsedReport;
 
   const activeSourceObj =
     SOURCE_OPTIONS.find((s) => s.id === preferredPriceSource) ?? SOURCE_OPTIONS[0];
@@ -298,13 +326,17 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
   };
 
   const handlePrimaryAction = async () => {
-    if (collectionItem && onUpdateCollectionItemDetails && onUpdateCollectionItemMissingParts) {
-      await onUpdateCollectionItemMissingParts(collectionItem.id, missingParts, activeFig);
+    if (collectionItem && onUpdateCollectionItemDetails) {
       await onUpdateCollectionItemDetails(
         collectionItem.id,
         collectionItem.purchasePriceEur,
         displayPrimaryPriceEur,
-        collectionItem.missingPartsNotes ?? ''
+        collectionItem.missingPartsNotes ?? '',
+        {
+          condition: missingParts.length > 0 ? 'used_incomplete' : condition,
+          missingPartNums: missingParts,
+          minifig: activeFig
+        }
       );
       setSavedToast('Actualizada en tu colección');
       setTimeout(() => setSavedToast(null), 1800);
@@ -754,11 +786,13 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
 
             <div className="bm-radio-list">
               {SOURCE_OPTIONS.map((opt) => {
-                const quoteVal = generatePriceComparisonReport(
-                  activeFig,
-                  condition === 'new' ? 'new' : 'used_complete',
-                  opt.id
-                ).estimatedMarketValueEur;
+                const quoteVal = activeConditionReport
+                  ? resolvePreferredPriceFromQuotes(activeConditionReport.quotes, opt.id)
+                  : generatePriceComparisonReport(
+                      activeFig,
+                      condition === 'new' ? 'new' : 'used_complete',
+                      opt.id
+                    ).estimatedMarketValueEur;
                 const active = preferredPriceSource === opt.id;
                 return (
                   <button
@@ -807,7 +841,10 @@ export const MinifigDetailSheet: React.FC<MinifigDetailSheetProps> = ({
                   preferredPriceSource={preferredPriceSource}
                   defaultExpanded
                   compact
-                  onReportChange={setLatestReport}
+                  onReportChange={(rep) => {
+                    if (rep.condition === 'new') setLiveNewReport(rep);
+                    else setLiveUsedReport(rep);
+                  }}
                 />
               </div>
             )}

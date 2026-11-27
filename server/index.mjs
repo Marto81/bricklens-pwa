@@ -385,13 +385,19 @@ async function handlePrices(url, res) {
       });
       if (bsRes.ok) {
         const html = await bsRes.text();
-        const newUsdMatch = html.match(/New:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i);
-        const usedUsdMatch = html.match(/Used:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i);
+        const parseUsd = (raw) => {
+          if (!raw) return 0;
+          const cleaned = String(raw).replace(/,/g, '');
+          const n = Number(cleaned);
+          return Number.isFinite(n) ? n : 0;
+        };
+        const newUsdMatch = html.match(/New:\s*<a[^>]*>~?\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+        const usedUsdMatch = html.match(/Used:\s*<a[^>]*>~?\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i);
         const yearMatch = html.match(/Year released<\/dt>\s*<dd><a[^>]*>(\d{4})<\/a>/i);
         const setsMatch = html.match(/Appears in<\/dt>\s*<dd><a[^>]*>(\d+)\s+set/i);
 
-        const newUsd = newUsdMatch ? Number(newUsdMatch[1].replace(',', '.')) : 0;
-        const usedUsd = usedUsdMatch ? Number(usedUsdMatch[1].replace(',', '.')) : 0;
+        const newUsd = parseUsd(newUsdMatch?.[1]);
+        const usedUsd = parseUsd(usedUsdMatch?.[1]);
         const usdToEur = 0.92;
 
         const targetUsd =
@@ -441,8 +447,8 @@ async function handlePrices(url, res) {
     fetchedAtIso: new Date().toISOString()
   };
 
-  setCached(cacheKey, payload, 6 * 3600_000);
-  return sendJson(res, 200, payload, 3600);
+  setCached(cacheKey, payload, hasLiveQuotes ? 6 * 3600_000 : 300_000);
+  return sendJson(res, 200, payload, hasLiveQuotes ? 3600 : 60);
 }
 
 async function handleBrickognizeProxy(req, url, res) {

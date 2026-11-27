@@ -32,6 +32,7 @@ import {
   exportCollectionToCsv,
   importCollectionFromText
 } from '../../db/collectionDb';
+import { generatePriceComparisonReport } from '../../services/priceAggregator';
 
 interface CollectionDashboardProps {
   collections: UserCollection[];
@@ -52,9 +53,16 @@ interface CollectionDashboardProps {
     itemId: string,
     purchasePriceEur: number,
     marketValueEur: number,
-    notes: string
+    notes: string,
+    extras?: {
+      condition?: MinifigCondition;
+      quantity?: number;
+      missingPartNums?: string[];
+      minifig?: MinifigureMetadata;
+    }
   ) => void;
   onRemoveItem: (itemId: string) => void;
+  onRemoveItemsBulk?: (itemIds: string[]) => void;
   onOpenItemDetail: (item: CollectionItem, expandParts?: boolean) => void;
   onBulkImportLines: (lines: BulkImportParsedLine[]) => void;
   onQuickAddManual: (
@@ -73,6 +81,7 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
   collections,
   activeCollection,
   allItems,
+  preferredPriceSource,
   initialModal = 'none',
   onClearInitialModal,
   onSelectCollection,
@@ -80,10 +89,9 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
   onRenameCollection,
   onDeleteCollection,
   onGoToScanner,
-  onUpdateQuantity,
-  onUpdateCondition,
   onUpdateItemDetails,
   onRemoveItem,
+  onRemoveItemsBulk,
   onOpenItemDetail,
   onBulkImportLines
 }) => {
@@ -108,6 +116,8 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
   const [quickEditItemId, setQuickEditItemId] = useState<string | null>(null);
   const [editCondition, setEditCondition] = useState<MinifigCondition>('used_complete');
   const [editPrice, setEditPrice] = useState('');
+  const [editPurchasePrice, setEditPurchasePrice] = useState('');
+  const [priceManuallyEdited, setPriceManuallyEdited] = useState(false);
   const [editQty, setEditQty] = useState(1);
   const [editNotes, setEditNotes] = useState('');
 
@@ -175,8 +185,22 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
     setQuickEditItemId(item.id);
     setEditCondition(item.condition);
     setEditPrice(item.estimatedUnitValueEur.toFixed(2));
+    setEditPurchasePrice(item.purchasePriceEur.toFixed(2));
+    setPriceManuallyEdited(false);
     setEditQty(item.quantity);
     setEditNotes(item.missingPartsNotes ?? '');
+  };
+
+  const handleQuickEditConditionChange = (nextCond: MinifigCondition) => {
+    setEditCondition(nextCond);
+    if (quickEditItem && !priceManuallyEdited) {
+      const suggested = generatePriceComparisonReport(
+        quickEditItem.minifig,
+        nextCond,
+        preferredPriceSource
+      ).estimatedMarketValueEur;
+      setEditPrice(suggested.toFixed(2));
+    }
   };
 
   const handleSaveQuickEdit = () => {
@@ -187,18 +211,21 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
         ? parsedPrice
         : quickEditItem.estimatedUnitValueEur;
 
-    if (editCondition !== quickEditItem.condition) {
-      onUpdateCondition(quickEditItem.id, editCondition);
-    }
-    const qtyDelta = editQty - quickEditItem.quantity;
-    if (qtyDelta !== 0) {
-      onUpdateQuantity(quickEditItem.id, qtyDelta);
-    }
+    const parsedPaid = Number(editPurchasePrice.replace(',', '.'));
+    const safePaid =
+      Number.isFinite(parsedPaid) && parsedPaid >= 0
+        ? parsedPaid
+        : quickEditItem.purchasePriceEur;
+
     onUpdateItemDetails(
       quickEditItem.id,
-      quickEditItem.purchasePriceEur,
+      safePaid,
       safeMarket,
-      editNotes.trim()
+      editNotes.trim(),
+      {
+        condition: editCondition,
+        quantity: editQty
+      }
     );
     setQuickEditItemId(null);
   };
@@ -214,8 +241,12 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
   };
 
   const handleDeleteSelectedBulk = () => {
-    for (const id of selectedIds) {
-      onRemoveItem(id);
+    if (onRemoveItemsBulk) {
+      onRemoveItemsBulk(selectedIds);
+    } else {
+      for (const id of selectedIds) {
+        onRemoveItem(id);
+      }
     }
     setSelectedIds([]);
     setSelectMode(false);
@@ -223,8 +254,8 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
 
   const importPreview = useMemo(() => {
     if (!importText.trim()) return null;
-    return importCollectionFromText(importText, 'auto');
-  }, [importText]);
+    return importCollectionFromText(importText, 'auto', preferredPriceSource);
+  }, [importText, preferredPriceSource]);
 
   const exportOutput = useMemo(() => {
     if (exportFormat === 'xml') return exportCollectionToBrickLinkXml(scopedItems);
@@ -548,21 +579,21 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                 <button
                   type="button"
                   className={editCondition === 'used_complete' ? 'active' : ''}
-                  onClick={() => setEditCondition('used_complete')}
+                  onClick={() => handleQuickEditConditionChange('used_complete')}
                 >
                   Usada
                 </button>
                 <button
                   type="button"
                   className={editCondition === 'new' ? 'active' : ''}
-                  onClick={() => setEditCondition('new')}
+                  onClick={() => handleQuickEditConditionChange('new')}
                 >
                   Nueva
                 </button>
                 <button
                   type="button"
                   className={editCondition === 'used_incomplete' ? 'active' : ''}
-                  onClick={() => setEditCondition('used_incomplete')}
+                  onClick={() => handleQuickEditConditionChange('used_incomplete')}
                 >
                   Incompleta
                 </button>
@@ -571,7 +602,7 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
 
             <div className="bm-qedit-grid-2">
               <div className="bm-field-group">
-                <label htmlFor="qedit-price-input">Precio (€)</label>
+                <label htmlFor="qedit-price-input">Mercado (€)</label>
                 <div className="bm-price-input-box">
                   <span>€</span>
                   <input
@@ -580,30 +611,48 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                     step="0.1"
                     min="0.5"
                     value={editPrice}
-                    onChange={(e) => setEditPrice(e.target.value)}
+                    onChange={(e) => {
+                      setEditPrice(e.target.value);
+                      setPriceManuallyEdited(true);
+                    }}
                   />
                 </div>
               </div>
 
               <div className="bm-field-group">
-                <label>Cantidad</label>
-                <div className="bm-mini-stepper tall">
-                  <button
-                    type="button"
-                    onClick={() => setEditQty((q) => Math.max(1, q - 1))}
-                    aria-label="Restar"
-                  >
-                    <Minus size={15} />
-                  </button>
-                  <strong>{editQty}</strong>
-                  <button
-                    type="button"
-                    onClick={() => setEditQty((q) => q + 1)}
-                    aria-label="Sumar"
-                  >
-                    <Plus size={15} />
-                  </button>
+                <label htmlFor="qedit-paid-input">Pagado (€)</label>
+                <div className="bm-price-input-box">
+                  <span>€</span>
+                  <input
+                    id="qedit-paid-input"
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    value={editPurchasePrice}
+                    onChange={(e) => setEditPurchasePrice(e.target.value)}
+                  />
                 </div>
+              </div>
+            </div>
+
+            <div className="bm-field-group">
+              <label>Cantidad</label>
+              <div className="bm-mini-stepper tall">
+                <button
+                  type="button"
+                  onClick={() => setEditQty((q) => Math.max(1, q - 1))}
+                  aria-label="Restar"
+                >
+                  <Minus size={15} />
+                </button>
+                <strong>{editQty}</strong>
+                <button
+                  type="button"
+                  onClick={() => setEditQty((q) => q + 1)}
+                  aria-label="Sumar"
+                >
+                  <Plus size={15} />
+                </button>
               </div>
             </div>
 
@@ -949,6 +998,14 @@ export const CollectionDashboard: React.FC<CollectionDashboardProps> = ({
                     .reduce((sum, line) => sum + line.quantity * line.estimatedUnitValueEur, 0)
                     .toFixed(2)}
                 </strong>
+              </div>
+            )}
+
+            {importPreview && importPreview.unknownTokens.length > 0 && (
+              <div className="bm-import-warn-pill">
+                Sin coincidencia ({importPreview.unknownTokens.length}):{' '}
+                {importPreview.unknownTokens.slice(0, 4).join(', ')}
+                {importPreview.unknownTokens.length > 4 ? '…' : ''}
               </div>
             )}
 

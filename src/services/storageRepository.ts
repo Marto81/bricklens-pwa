@@ -9,6 +9,7 @@ import type {
   UserCollection
 } from '../types/minifig';
 import {
+  bulkDeleteCollectionItems,
   bulkUpsertCollectionItems,
   clearApiCaches,
   createCollection,
@@ -25,6 +26,7 @@ import {
   saveAppSettings,
   saveObservedPrice,
   setActiveCollectionId,
+  updateCollectionItem,
   updateItemMissingParts,
   upsertCollectionMinifig
 } from '../db/collectionDb';
@@ -61,6 +63,19 @@ export interface BrickLensStorageRepository {
     notes?: string;
   }): Promise<CollectionItem>;
   bulkUpsert(lines: BulkImportParsedLine[], collectionId?: string | null): Promise<CollectionItem[]>;
+  updateItem(
+    itemId: string,
+    patch: {
+      condition?: MinifigCondition;
+      quantity?: number;
+      purchasePriceEur?: number;
+      estimatedUnitValueEur?: number;
+      missingPartNums?: string[];
+      minifig?: MinifigureMetadata;
+      missingPartsNotes?: string;
+    }
+  ): Promise<CollectionItem | null>;
+  bulkDeleteItems(itemIds: string[]): Promise<void>;
   updateMissingParts(
     itemId: string,
     missingPartNums: string[],
@@ -113,6 +128,8 @@ export const storageRepository: BrickLensStorageRepository = {
   restoreDemoCollection: () => restoreDemoCollection(),
   upsertMinifig: (params) => upsertCollectionMinifig(params),
   bulkUpsert: (lines, collectionId) => bulkUpsertCollectionItems(lines, collectionId),
+  updateItem: (itemId, patch) => updateCollectionItem(itemId, patch),
+  bulkDeleteItems: (itemIds) => bulkDeleteCollectionItems(itemIds),
   updateMissingParts: (itemId, missingPartNums, enrichedMinifig) =>
     updateItemMissingParts(itemId, missingPartNums, enrichedMinifig),
   saveObservedPrice: (params) => saveObservedPrice(params),

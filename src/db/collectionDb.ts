@@ -934,6 +934,109 @@ export async function updateItemMissingParts(
   return updated;
 }
 
+/**
+ * Actualización atómica de una figura en colección (estado, cantidad, coste compra,
+ * precio mercado, piezas faltantes y notas) evitando condiciones de carrera en IndexedDB.
+ */
+export async function updateCollectionItem(
+  itemId: string,
+  patch: {
+    condition?: MinifigCondition;
+    quantity?: number;
+    purchasePriceEur?: number;
+    estimatedUnitValueEur?: number;
+    missingPartNums?: string[];
+    minifig?: MinifigureMetadata;
+    missingPartsNotes?: string;
+  }
+): Promise<CollectionItem | null> {
+  const item = await db.collectionItems.get(itemId);
+  if (!item) return null;
+
+  const nowIso = new Date().toISOString();
+  const nextMinifig = patch.minifig ?? item.minifig;
+  const nextQuantity =
+    patch.quantity !== undefined ? Math.max(1, Math.round(patch.quantity)) : item.quantity;
+  const nextPurchase =
+    patch.purchasePriceEur !== undefined
+      ? Math.max(0, roundEur(patch.purchasePriceEur))
+      : item.purchasePriceEur;
+
+  let nextMissing =
+    patch.missingPartNums !== undefined
+      ? Array.from(new Set(patch.missingPartNums.filter(Boolean)))
+      : item.missingPartNums ?? [];
+
+  let nextCondition: MinifigCondition = patch.condition ?? item.condition;
+  if (nextCondition === 'new' && nextMissing.length > 0) {
+    nextMissing = [];
+  } else if (patch.missingPartNums !== undefined && nextMissing.length > 0) {
+    nextCondition = 'used_incomplete';
+  } else if (
+    patch.missingPartNums !== undefined &&
+    nextMissing.length === 0 &&
+    nextCondition === 'used_incomplete'
+  ) {
+    nextCondition = 'used_complete';
+  }
+
+  let nextMarket =
+    patch.estimatedUnitValueEur !== undefined
+      ? Math.max(0.5, roundEur(patch.estimatedUnitValueEur))
+      : item.estimatedUnitValueEur;
+
+  let nextBaseComplete = item.baseCompleteUnitValueEur;
+  if (nextCondition !== 'used_incomplete') {
+    nextBaseComplete = nextMarket;
+  } else if (patch.missingPartNums !== undefined && patch.estimatedUnitValueEur === undefined) {
+    const refComplete =
+      nextBaseComplete ??
+      generatePriceComparisonReport(nextMinifig, 'used_complete').estimatedMarketValueEur;
+    nextBaseComplete = refComplete;
+    nextMarket = computeMissingPartsAdjustment(refComplete, nextMinifig.parts, nextMissing)
+      .adjustedValueEur;
+  }
+
+  const updatedMinifig: MinifigureMetadata =
+    patch.estimatedUnitValueEur !== undefined
+      ? {
+          ...nextMinifig,
+          baseMarketPriceEur: {
+            ...nextMinifig.baseMarketPriceEur,
+            [nextCondition]: nextMarket
+          },
+          isEstimatedFallbackPrice: false
+        }
+      : nextMinifig;
+
+  const updated: CollectionItem = {
+    ...item,
+    minifig: updatedMinifig,
+    condition: nextCondition,
+    quantity: nextQuantity,
+    purchasePriceEur: nextPurchase,
+    estimatedUnitValueEur: nextMarket,
+    baseCompleteUnitValueEur: nextBaseComplete,
+    missingPartNums: nextMissing.length > 0 ? nextMissing : undefined,
+    missingPartsNotes:
+      patch.missingPartsNotes !== undefined
+        ? patch.missingPartsNotes.trim() || undefined
+        : item.missingPartsNotes,
+    lastValuationIso: nowIso
+  };
+
+  await db.transaction('rw', db.collectionItems, db.collections, async () => {
+    await db.collectionItems.put(updated);
+    await db.collections.update(item.collectionId, { updatedAtIso: nowIso });
+  });
+  return updated;
+}
+
+export async function bulkDeleteCollectionItems(itemIds: string[]): Promise<void> {
+  if (itemIds.length === 0) return;
+  await db.collectionItems.bulkDelete(itemIds);
+}
+
 export async function saveObservedPrice(params: {
   figId: string;
   condition: MinifigCondition;

@@ -37,9 +37,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
   const stats = useMemo(() => calculateCollectionStats(allItems), [allItems]);
 
   const effectiveTotalEur =
-    priceMode === 'my_prices' && stats.totalInvestedEur > 0
-      ? stats.totalInvestedEur
-      : stats.totalMarketValueEur;
+    priceMode === 'my_prices' ? stats.totalInvestedEur : stats.totalMarketValueEur;
 
   const avgUnitValueEur =
     stats.totalUnits > 0 ? Math.round((effectiveTotalEur / stats.totalUnits) * 100) / 100 : 0;
@@ -101,9 +99,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
       const colItems = allItems.filter((it) => it.collectionId === col.id);
       const colStats = calculateCollectionStats(colItems);
       const value =
-        priceMode === 'my_prices' && colStats.totalInvestedEur > 0
-          ? colStats.totalInvestedEur
-          : colStats.totalMarketValueEur;
+        priceMode === 'my_prices' ? colStats.totalInvestedEur : colStats.totalMarketValueEur;
       return {
         collection: col,
         dotColor: col.color || COLLECTION_DOT_COLORS[idx % COLLECTION_DOT_COLORS.length],

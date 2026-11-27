@@ -5,6 +5,7 @@ import type { BulkScanDetectedItem, NormalizedBoundingBox } from '../../types/mi
 interface InteractiveBulkOverlayProps {
   imageUrl: string;
   aspectRatio?: number;
+  expanded?: boolean;
   items: BulkScanDetectedItem[];
   priceByBoxId?: Record<string, number>;
   selectedBoxId: string | null;
@@ -47,6 +48,7 @@ function clamp01(n: number): number {
 export const InteractiveBulkOverlay: React.FC<InteractiveBulkOverlayProps> = ({
   imageUrl,
   aspectRatio = 1.5,
+  expanded = false,
   items,
   priceByBoxId,
   selectedBoxId,
@@ -247,8 +249,8 @@ export const InteractiveBulkOverlay: React.FC<InteractiveBulkOverlayProps> = ({
 
       <div
         ref={containerRef}
-        className={`bulk-photo-stage ${addMode ? 'add-mode' : ''}`}
-        style={{ aspectRatio: String(Math.max(0.75, Math.min(2.2, aspectRatio))) }}
+        className={`bulk-photo-stage ${addMode ? 'add-mode' : ''} ${expanded ? 'expanded' : ''}`}
+        style={{ aspectRatio: String(Math.max(0.35, Math.min(3.0, aspectRatio || 1.5))) }}
         onPointerDown={handleStagePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -310,11 +312,13 @@ export const InteractiveBulkOverlay: React.FC<InteractiveBulkOverlayProps> = ({
         )}
       </div>
 
-      <p className="bulk-editor-hint">
-        {addMode
-          ? 'Toca sobre una figura o arrastra un rectángulo para analizarla individualmente.'
-          : 'Toca un recuadro para moverlo, ajustar su esquina o re-escanear solo esa figura.'}
-      </p>
+      {(expanded || addMode) && (
+        <p className="bulk-editor-hint visible">
+          {addMode
+            ? 'Toca sobre una figura o arrastra un rectángulo para analizarla individualmente.'
+            : 'Toca un recuadro para moverlo, ajustar su esquina o re-escanear solo esa figura.'}
+        </p>
+      )}
     </div>
   );
 };

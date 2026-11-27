@@ -156,12 +156,22 @@ if (!isset($liveQuotes['bricklink'])) {
     if ($bsCode === 200 && is_string($bsHtml) && $bsHtml !== '') {
         $newUsd = 0.0;
         $usedUsd = 0.0;
-        if (preg_match('/New:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i', $bsHtml, $mNew)) {
-            $newUsd = (float) str_replace(',', '.', $mNew[1]);
+        $yearReleased = null;
+        $appearsInSets = null;
+
+        if (preg_match('/New:\s*<a[^>]*>~?\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i', $bsHtml, $mNew)) {
+            $newUsd = (float) str_replace(',', '', $mNew[1]);
         }
-        if (preg_match('/Used:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i', $bsHtml, $mUsed)) {
-            $usedUsd = (float) str_replace(',', '.', $mUsed[1]);
+        if (preg_match('/Used:\s*<a[^>]*>~?\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i', $bsHtml, $mUsed)) {
+            $usedUsd = (float) str_replace(',', '', $mUsed[1]);
         }
+        if (preg_match('/Year released<\/dt>\s*<dd><a[^>]*>(\d{4})<\/a>/i', $bsHtml, $mYear)) {
+            $yearReleased = (int) $mYear[1];
+        }
+        if (preg_match('/Appears in<\/dt>\s*<dd><a[^>]*>(\d+)\s+set/i', $bsHtml, $mSets)) {
+            $appearsInSets = (int) $mSets[1];
+        }
+
         $usdToEur = 0.92;
         $targetUsd = $condition === 'new'
             ? ($newUsd > 0 ? $newUsd : ($usedUsd * 1.32))
@@ -180,17 +190,19 @@ if (!isset($liveQuotes['bricklink'])) {
             ];
         }
 
-        if ($newUsd > 0 || $usedUsd > 0) {
-            $referenceMeta = [
+        if ($newUsd > 0 || $usedUsd > 0 || $yearReleased !== null) {
+            $referenceMeta = array_filter([
                 'newEur' => $newUsd > 0 ? round($newUsd * $usdToEur, 2) : null,
                 'usedEur' => $usedUsd > 0 ? round($usedUsd * $usdToEur, 2) : null,
-            ];
+                'yearReleased' => $yearReleased,
+                'appearsInSets' => $appearsInSets,
+            ], static fn($v) => $v !== null);
         }
     }
 }
 
 $hasLive = !empty($liveQuotes);
-header('Cache-Control: public, max-age=3600');
+header('Cache-Control: ' . ($hasLive ? 'public, max-age=3600' : 'public, max-age=60'));
 echo json_encode([
     'figId' => $figId,
     'condition' => $condition,

@@ -14,9 +14,10 @@ import {
   identifyMinifigureFromImage,
   identifyPartFromImage
 } from '../services/visionService';
-import { findMinifigsByScannedParts } from '../services/catalogService';
+import { fetchHybridPriceReport, findMinifigsByScannedParts } from '../services/catalogService';
 import { lookupCmfCode } from '../data/cmfCodes';
 import {
+  bulkDeleteCollectionItems,
   bulkUpsertCollectionItems,
   calculateCollectionStats,
   createCollection,
@@ -39,6 +40,7 @@ import {
   restoreDemoCollection,
   saveAppSettings,
   saveObservedPrice,
+  updateCollectionItem,
   updateItemMissingParts,
   upsertCollectionMinifig
 } from '../db/collectionDb';
@@ -725,5 +727,87 @@ describe('BrickLens v2.0 — Missing Parts, Observed Prices, Lot Evaluator, Part
     expect(unknownCommander.baseMarketPriceEur.used_complete).toBeGreaterThan(
       unknownDroid.baseMarketPriceEur.used_complete * 1.4
     );
+  });
+
+  it('atomically updates condition, quantity, purchase price, market value, and notes without race conditions, and supports bulk delete', async () => {
+    const col = await createCollection('Test Atomicity');
+    const sw = MINIFIG_CATALOG.find((m) => m.figId === 'sw0585')!;
+    const itemA = await upsertCollectionMinifig({
+      collectionId: col.id,
+      minifig: sw,
+      condition: 'used_complete',
+      quantity: 1,
+      purchasePriceEur: 4.0,
+      estimatedUnitValueEur: 5.5
+    });
+    const itemB = await upsertCollectionMinifig({
+      collectionId: col.id,
+      minifig: MINIFIG_CATALOG[2],
+      condition: 'used_complete',
+      quantity: 1,
+      purchasePriceEur: 40.0,
+      estimatedUnitValueEur: 54.0
+    });
+
+    const updated = await updateCollectionItem(itemA.id, {
+      condition: 'new',
+      quantity: 3,
+      purchasePriceEur: 8.25,
+      estimatedUnitValueEur: 11.4,
+      missingPartsNotes: 'Selladas de tienda oficial'
+    });
+
+    expect(updated).not.toBeNull();
+    expect(updated!.condition).toBe('new');
+    expect(updated!.quantity).toBe(3);
+    expect(updated!.purchasePriceEur).toBe(8.25);
+    expect(updated!.estimatedUnitValueEur).toBe(11.4);
+    expect(updated!.missingPartsNotes).toBe('Selladas de tienda oficial');
+
+    const persisted = await db.collectionItems.get(itemA.id);
+    expect(persisted?.condition).toBe('new');
+    expect(persisted?.quantity).toBe(3);
+    expect(persisted?.purchasePriceEur).toBe(8.25);
+
+    await bulkDeleteCollectionItems([itemA.id, itemB.id]);
+    expect(await db.collectionItems.count()).toBe(0);
+  });
+
+  it('persists live BrickLink referenceMeta in IndexedDB cache so cached and fresh reports match identically', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          figId: 'sw1171',
+          condition: 'used_complete',
+          configured: true,
+          liveQuotes: {
+            bricklink: {
+              minPriceEur: 14.86,
+              avgPriceEur: 18.22,
+              maxPriceEur: 22.29,
+              soldAvg6mEur: 17.69,
+              activeListingsCount: 16
+            }
+          },
+          referenceMeta: {
+            newEur: 21.89,
+            usedEur: 17.69,
+            yearReleased: 2021,
+            appearsInSets: 1
+          },
+          fetchedAtIso: new Date().toISOString()
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    );
+
+    const fig = createCustomMinifigMetadata({ figId: 'sw1171', name: 'The Armorer' });
+    const freshReport = await fetchHybridPriceReport(fig, 'used_complete', 'weighted', false);
+    const cachedReport = await fetchHybridPriceReport(fig, 'used_complete', 'weighted', false);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(freshReport.livePortalsCount).toBe(1);
+    expect(cachedReport.livePortalsCount).toBe(1);
+    expect(cachedReport.estimatedMarketValueEur).toBe(freshReport.estimatedMarketValueEur);
   });
 });

@@ -205,13 +205,18 @@ export default async function handler(req: Request): Promise<Response> {
       });
       if (bsRes.ok) {
         const html = await bsRes.text();
-        const newUsdMatch = html.match(/New:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i);
-        const usedUsdMatch = html.match(/Used:\s*<a[^>]*>~?\$?([0-9]+(?:[.,][0-9]+)?)/i);
+        const parseUsd = (raw?: string): number => {
+          if (!raw) return 0;
+          const n = Number(raw.replace(/,/g, ''));
+          return Number.isFinite(n) ? n : 0;
+        };
+        const newUsdMatch = html.match(/New:\s*<a[^>]*>~?\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+        const usedUsdMatch = html.match(/Used:\s*<a[^>]*>~?\$?([0-9][0-9,]*(?:\.[0-9]+)?)/i);
         const yearMatch = html.match(/Year released<\/dt>\s*<dd><a[^>]*>(\d{4})<\/a>/i);
         const setsMatch = html.match(/Appears in<\/dt>\s*<dd><a[^>]*>(\d+)\s+set/i);
 
-        const newUsd = newUsdMatch ? Number(newUsdMatch[1].replace(',', '.')) : 0;
-        const usedUsd = usedUsdMatch ? Number(usedUsdMatch[1].replace(',', '.')) : 0;
+        const newUsd = parseUsd(newUsdMatch?.[1]);
+        const usedUsd = parseUsd(usedUsdMatch?.[1]);
         const usdToEur = 0.92;
 
         const targetUsd =
@@ -262,6 +267,6 @@ export default async function handler(req: Request): Promise<Response> {
       fetchedAtIso: new Date().toISOString()
     },
     200,
-    3600
+    hasLiveQuotes ? 3600 : 60
   );
 }

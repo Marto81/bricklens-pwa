@@ -261,6 +261,12 @@ export interface CatalogCacheRecord {
       MinifigCondition,
       {
         liveQuotes: Partial<Record<MarketplaceId, LivePortalQuoteSnapshot>>;
+        referenceMeta?: {
+          newEur?: number;
+          usedEur?: number;
+          yearReleased?: number;
+          appearsInSets?: number;
+        } | null;
         fetchedAtIso: string;
       }
     >

@@ -223,10 +223,17 @@ export function generatePriceComparisonReport(
   }
 
   const catalogBasePrice = minifig.baseMarketPriceEur[condition];
+  const liveBrickLinkAnchor =
+    overrides?.liveQuotes?.bricklink?.soldAvg6mEur &&
+    overrides.liveQuotes.bricklink.soldAvg6mEur > 0
+      ? overrides.liveQuotes.bricklink.soldAvg6mEur
+      : undefined;
+
   const anchorBasePrice =
-    minifig.isEstimatedFallbackPrice && liveOrObservedValues.length > 0
+    liveBrickLinkAnchor ??
+    (minifig.isEstimatedFallbackPrice && liveOrObservedValues.length > 0
       ? liveOrObservedValues.reduce((s, v) => s + v, 0) / liveOrObservedValues.length
-      : catalogBasePrice;
+      : catalogBasePrice);
 
   const nowIso = new Date().toISOString();
 

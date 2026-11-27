@@ -222,6 +222,11 @@ export const SettingsSheet: React.FC<SettingsSheetProps> = ({
                   active: true
                 },
                 {
+                  name: 'BrickLink (Público)',
+                  desc: 'Precios New / Used en vivo sin clave',
+                  active: Boolean(status?.reachable)
+                },
+                {
                   name: 'Rebrickable',
                   desc: 'Catálogo +15k y despiece real',
                   active: Boolean(status?.rebrickable)

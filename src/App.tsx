@@ -17,6 +17,7 @@ import {
   DEMO_COLLECTION_ID
 } from './db/collectionDb';
 import { setRuntimeProxyBaseUrl } from './services/apiConfig';
+import { fetchHybridPriceReport } from './services/catalogService';
 import {
   computeMissingPartsAdjustment,
   generatePriceComparisonReport
@@ -317,15 +318,15 @@ export function App() {
   const handleUpdateCondition = async (itemId: string, newCondition: MinifigCondition) => {
     const item = await db.collectionItems.get(itemId);
     if (!item) return;
-    const report = generatePriceComparisonReport(item.minifig, newCondition, preferredPriceSource);
-    await db.collectionItems.update(itemId, {
+    const report = await fetchHybridPriceReport(
+      item.minifig,
+      newCondition,
+      preferredPriceSource,
+      false
+    );
+    await storageRepository.updateItem(itemId, {
       condition: newCondition,
-      estimatedUnitValueEur: report.estimatedMarketValueEur,
-      baseCompleteUnitValueEur:
-        newCondition !== 'used_incomplete'
-          ? report.estimatedMarketValueEur
-          : item.baseCompleteUnitValueEur,
-      lastValuationIso: new Date().toISOString()
+      estimatedUnitValueEur: report.estimatedMarketValueEur
     });
     await syncFromDatabase();
   };
@@ -334,27 +335,22 @@ export function App() {
     itemId: string,
     purchasePriceEur: number,
     marketValueEur: number,
-    notes: string
+    notes: string,
+    extras?: {
+      condition?: MinifigCondition;
+      quantity?: number;
+      missingPartNums?: string[];
+      minifig?: MinifigureMetadata;
+    }
   ) => {
-    const item = await db.collectionItems.get(itemId);
-    if (!item) return;
-
-    const cleanMarket = Math.max(0.5, Math.round(marketValueEur * 100) / 100);
-    const updatedMinifig: MinifigureMetadata = {
-      ...item.minifig,
-      baseMarketPriceEur: {
-        ...item.minifig.baseMarketPriceEur,
-        [item.condition]: cleanMarket
-      },
-      isEstimatedFallbackPrice: false
-    };
-
-    await db.collectionItems.update(itemId, {
-      minifig: updatedMinifig,
-      purchasePriceEur: Math.max(0, Math.round(purchasePriceEur * 100) / 100),
-      estimatedUnitValueEur: cleanMarket,
-      lastValuationIso: new Date().toISOString(),
-      missingPartsNotes: notes || undefined
+    await storageRepository.updateItem(itemId, {
+      purchasePriceEur,
+      estimatedUnitValueEur: marketValueEur,
+      missingPartsNotes: notes,
+      condition: extras?.condition,
+      quantity: extras?.quantity,
+      missingPartNums: extras?.missingPartNums,
+      minifig: extras?.minifig
     });
     await syncFromDatabase();
   };
@@ -373,41 +369,54 @@ export function App() {
     await syncFromDatabase();
   };
 
+  const handleRemoveItemsBulk = async (itemIds: string[]) => {
+    await storageRepository.bulkDeleteItems(itemIds);
+    await syncFromDatabase();
+  };
+
   const handleRefreshValuations = async (sourceOverride?: PreferredPriceSource) => {
     const activeSource = sourceOverride ?? preferredPriceSource;
     const current = await db.collectionItems.toArray();
     const nowIso = new Date().toISOString();
-    const updated = current.map((item) => {
-      const hasMissing = Boolean(item.missingPartNums && item.missingPartNums.length > 0);
-      if (hasMissing) {
-        const completeRef = generatePriceComparisonReport(
+    const updated = await Promise.all(
+      current.map(async (item) => {
+        const hasMissing = Boolean(item.missingPartNums && item.missingPartNums.length > 0);
+        if (hasMissing) {
+          const completeRep = await fetchHybridPriceReport(
+            item.minifig,
+            'used_complete',
+            activeSource,
+            false
+          );
+          const adj = computeMissingPartsAdjustment(
+            completeRep.estimatedMarketValueEur,
+            item.minifig.parts,
+            item.missingPartNums
+          );
+          return {
+            ...item,
+            baseCompleteUnitValueEur: completeRep.estimatedMarketValueEur,
+            estimatedUnitValueEur: adj.adjustedValueEur,
+            lastValuationIso: nowIso
+          };
+        }
+        const report = await fetchHybridPriceReport(
           item.minifig,
-          'used_complete',
-          activeSource
-        ).estimatedMarketValueEur;
-        const adj = computeMissingPartsAdjustment(
-          completeRef,
-          item.minifig.parts,
-          item.missingPartNums
+          item.condition,
+          activeSource,
+          false
         );
         return {
           ...item,
-          baseCompleteUnitValueEur: completeRef,
-          estimatedUnitValueEur: adj.adjustedValueEur,
+          baseCompleteUnitValueEur:
+            item.condition !== 'used_incomplete'
+              ? report.estimatedMarketValueEur
+              : item.baseCompleteUnitValueEur,
+          estimatedUnitValueEur: report.estimatedMarketValueEur,
           lastValuationIso: nowIso
         };
-      }
-      const report = generatePriceComparisonReport(item.minifig, item.condition, activeSource);
-      return {
-        ...item,
-        baseCompleteUnitValueEur:
-          item.condition !== 'used_incomplete'
-            ? report.estimatedMarketValueEur
-            : item.baseCompleteUnitValueEur,
-        estimatedUnitValueEur: report.estimatedMarketValueEur,
-        lastValuationIso: nowIso
-      };
-    });
+      })
+    );
     await db.collectionItems.bulkPut(updated);
     await syncFromDatabase();
   };
@@ -476,10 +485,11 @@ export function App() {
             onGoToScanner={() => setScannerOpen(true)}
             onUpdateQuantity={(id, delta) => void handleUpdateQuantity(id, delta)}
             onUpdateCondition={(id, cond) => void handleUpdateCondition(id, cond)}
-            onUpdateItemDetails={(id, paid, mkt, notes) =>
-              void handleUpdateItemDetails(id, paid, mkt, notes)
+            onUpdateItemDetails={(id, paid, mkt, notes, extras) =>
+              void handleUpdateItemDetails(id, paid, mkt, notes, extras)
             }
             onRemoveItem={(id) => void handleRemoveItem(id)}
+            onRemoveItemsBulk={(ids) => void handleRemoveItemsBulk(ids)}
             onOpenItemDetail={handleOpenCollectionItemDetail}
             onBulkImportLines={(lines) =>
               void handleBulkAddToCollection(lines, activeCollectionId)
@@ -505,7 +515,12 @@ export function App() {
             preferredPriceSource={preferredPriceSource}
             onOpenMinifigDetail={handleOpenMinifigDetail}
             onQuickAdd={async (minifig, cond, qty, targetColId) => {
-              const report = generatePriceComparisonReport(minifig, cond, preferredPriceSource);
+              const report = await fetchHybridPriceReport(
+                minifig,
+                cond,
+                preferredPriceSource,
+                false
+              );
               await handleAddToCollectionFromAny({
                 collectionId: targetColId,
                 minifig,
